@@ -1543,6 +1543,96 @@ input, textarea, select { accent-color: var(--accent); }
   white-space: pre-wrap;
 }
 
+.qa-search-trace {
+  width: 100%;
+  min-width: 0;
+}
+
+.qa-trace-body {
+  max-height: min(480px, 60vh);
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  margin-top: 10px;
+  padding-right: 10px;
+  font-size: 13px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.qa-trace-current {
+  border-left: 3px solid var(--green, #00885a);
+  padding: 6px 12px;
+  background: #f2f8f5;
+}
+
+.qa-trace-current strong {
+  display: block;
+  color: #21664b;
+}
+
+.qa-trace-step {
+  border-bottom: 1px solid #e5e8eb;
+  padding: 10px 0;
+}
+
+.qa-trace-step > summary {
+  display: list-item;
+  padding-right: 4px;
+}
+
+.qa-trace-duration {
+  display: inline-block;
+  margin-left: 12px;
+  color: #737c86;
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+
+.qa-trace-step-body {
+  margin: 8px 0 0 14px;
+}
+
+.qa-trace-params {
+  margin: 8px 0;
+}
+
+.qa-trace-params:empty {
+  display: none;
+}
+
+.qa-trace-param {
+  display: grid;
+  grid-template-columns: 90px minmax(0, 1fr);
+  gap: 8px;
+  padding: 3px 0;
+}
+
+.qa-trace-param dt {
+  color: #737c86;
+}
+
+.qa-trace-param dd {
+  min-width: 0;
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.qa-trace-preview {
+  margin-top: 10px;
+}
+
+.qa-trace-note {
+  margin-top: 12px;
+}
+
+@media (max-width: 520px) {
+  .qa-trace-param {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
+  }
+}
+
 .rag-shell {
   display: grid;
   align-content: start;
@@ -2465,3 +2555,7 @@ input, textarea, select { accent-color: var(--accent); }
 .goal-capability-report ul { margin: 8px 0; padding-left: 20px; }
 .goal-capability-report li { margin: 6px 0; }
 .goal-capability-report li span { display: block; color: #59636c; }
+/* The task contract remains inspectable without expanding the execution log. */
+.qa-current-task { margin-bottom: 10px; }
+.qa-current-task > summary { white-space: normal; overflow-wrap: anywhere; }
+.qa-task-requirement { padding: 8px 0; }

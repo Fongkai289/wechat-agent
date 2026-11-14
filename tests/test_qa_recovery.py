@@ -13,7 +13,7 @@ from wechat_agent.qa_recovery import (
     CallReceipts, checkpoint_path, durable_model_call, recorded_call, read_snapshot,
 )
 from wechat_agent.goal_checkpoints import checkpoint_session, GoalResumeRequired
-from tests.test_qa_agent import NOW, PEOPLE, completion, decision, action, accept_reviews
+from tests.test_qa_agent import NOW, PEOPLE, decision, accept_reviews
 from tests.test_background_jobs import finished
 
 
@@ -121,7 +121,9 @@ class QaRecoveryTests(unittest.TestCase):
         self.assertEqual(len(calls),1)
         self.assertEqual(len(outputs),1)
         self.assertEqual(calls[0]['tool_calls'][0]['id'],outputs[0]['tool_call_id'])
-        self.assertEqual(json.loads(outputs[0]['content'])['items'][0]['text'],'original')
+        self.assertEqual(json.loads(outputs[0]['content'])['returned'],1)
+        request = json.loads(self.complete.call_args.args[0][-1]['content'])
+        self.assertEqual(request['evidence'][0]['text'],'original')
 
     def test_tool_results_reused_when_later_tool_in_same_node_is_interrupted(self):
         self.complete.side_effect = [decision('timeline'),
@@ -230,7 +232,7 @@ class QaRecoveryHTTPTests(unittest.TestCase):
         for target, value in (
             ('load_llm_config', Mock(return_value={'qa': {'model': 'fixture', 'base_url': 'https://example.test', 'api_key': 'fixture'}})),
             ('load_or_build_qa_index', Mock(return_value={'message_count': 1, 'people_list': PEOPLE})),
-            ('ConversationTools', Mock(return_value=tools)), ('call_chat_payload', self.api), ('call_qa_answer', self.answer),
+            ('call_chat_payload', self.api), ('call_qa_answer', self.answer),
         ):
             p = patch.object(web, target, value)
             p.start(); self.addCleanup(p.stop)

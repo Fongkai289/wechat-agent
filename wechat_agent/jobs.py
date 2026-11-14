@@ -27,6 +27,20 @@ def check_job_cancelled():
         job.check()
 
 
+def bind_job(invoke):
+    """Propagate cancellation to worker threads without sharing browser state."""
+    job = getattr(_current, 'job', None)
+    def run():
+        previous = getattr(_current, 'job', None)
+        _current.job = job
+        try:
+            check_job_cancelled()
+            return invoke()
+        finally:
+            _current.job = previous
+    return run
+
+
 def wait_for_job_retry(seconds):
     job = getattr(_current, "job", None)
     if job is None:

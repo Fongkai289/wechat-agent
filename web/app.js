@@ -1592,8 +1592,8 @@ function renderRagSearchResult(result) {
     ["主路", search.primary === "embedding" ? "Embedding" : "本地"],
     ["检索 Query", queries.length || 1],
     ["分路", branches.length],
-    ["唯一候选", retrieval.candidate_count],
-    ["已重排", search.rerank_count],
+    ["候选消息", retrieval.candidate_count],
+    [search.rerank_unit === 'conversation_window' ? "已重排窗口" : "已重排", search.rerank_count],
     ["入模", retrieval.context_count],
     ["FTS", search.fts_count],
     ["LIKE", search.like_count],
@@ -1854,6 +1854,8 @@ function handleQaStreamEvent(event, assistantMessage) {
   if (event.turn_id) assistantMessage.turn_id = event.turn_id;
   if (event.event === "progress") {
     assistantMessage.progress = event.message || "正在处理";
+    if (event.retrieval) assistantMessage.retrieval = event.retrieval;
+    updateQaTraceNode(assistantMessage);
     updateQaProgressFromMessage(assistantMessage);
     updateQaElapsedNode(assistantMessage);
     return;
@@ -1897,9 +1899,12 @@ function renderQaMessages() {
     qaMessages.innerHTML = `<div class="qa-empty">问一个关于聊天记录的问题</div>`;
     return;
   }
+  const expanded = qaExpandedDetails(qaMessages);
+  const scrollTop = qaMessages.scrollTop;
   qaMessages.innerHTML = state.qaMessages.map(renderQaMessage).join("");
+  restoreQaDetails(qaMessages, expanded);
   bindQaMessageActions();
-  qaMessages.scrollTop = qaMessages.scrollHeight;
+  qaMessages.scrollTop = expanded.length ? scrollTop : qaMessages.scrollHeight;
 }
 
 function renderQaMessage(message) {
@@ -2044,40 +2049,121 @@ function renderQaSources(message) {
       `;
     })
     .join("");
-  const trace = renderQaSearchTrace(retrieval);
+  const trace = `<div data-qa-trace="${escapeHtml(message.id || message.turn_id || '')}">${renderQaSearchTrace(retrieval, message)}</div>`;
   return trace + (sources
     ? `<details class="qa-sources"><summary>${escapeHtml(summary)}</summary>${sources}</details>`
     : "");
 }
 
-function renderQaSearchTrace(retrieval) {
-  const plan = retrieval.query_plan;
-  if (!plan) return "";
+function qaExpandedDetails(root) {
+  return Array.from(root.querySelectorAll('details[data-qa-detail][open]')).map(node => node.dataset.qaDetail);
+}
+
+function restoreQaDetails(root, expanded) {
+  for (const node of root.querySelectorAll('details[data-qa-detail]')) {
+    if (expanded.includes(node.dataset.qaDetail)) node.open = true;
+  }
+}
+
+function updateQaTraceNode(message) {
+  const id = message.id || message.turn_id;
+  if (!id) return;
+  const root = qaMessages.querySelector(`[data-qa-trace="${CSS.escape(id)}"]`);
+  if (!root) return;
+  const expanded = qaExpandedDetails(root);
+  const body = root.querySelector('.qa-trace-body');
+  const top = body?.scrollTop || 0;
+  root.innerHTML = renderQaSearchTrace(message.retrieval || {}, message);
+  restoreQaDetails(root, expanded);
+  const nextBody = root.querySelector('.qa-trace-body');
+  if (nextBody) nextBody.scrollTop = top;
+}
+
+function qaTraceDuration(ms) {
+  return `${(Math.max(0, Number(ms) || 0) / 1000).toFixed(1)}s`;
+}
+
+function qaTraceParameters(parameters) {
+  const labels = {query:'检索目标',queries:'内容查询列表',chat_ids:'会话 ID',person_ids:'人物 ID',source_ids:'证据 ID',
+    filters:'本步范围',size:'请求条数',offset:'分页起点',before:'向前条数',after:'向后条数',
+    sql:'只读 SQL',params:'SQL 参数',since:'开始时间',until:'结束时间',window_seconds:'窗口秒数',
+    min_similarity:'相似度阈值',chat_id:'会话 ID',latest:'最近条数',max_gap_minutes:'最大间隔（分钟）'};
+  return Object.entries(parameters || {}).filter(([key,value]) => key !== 'tool' && value != null && value !== '')
+    .map(([key,value]) => `<div class="qa-trace-param"><dt>${escapeHtml(labels[key] || key)}</dt><dd>${escapeHtml(typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value))}</dd></div>`).join('');
+}
+
+function qaTraceTimings(timings) {
+  const labels = {recall_ms:'并行召回总耗时',semantic_ms:'语义召回（含向量请求）',embedding_ms:'查询 Embedding',
+    vector_match_ms:'本地向量匹配',lexical_and_hydration_ms:'关键词召回与消息回查',
+    rerank_ms:'API 重排（墙钟时间）',context_expansion_ms:'原文与上下文展开'};
+  return Object.entries(timings || {}).filter(([key]) => labels[key])
+    .map(([key,value]) => `<div class="qa-trace-param"><dt>${labels[key]}</dt><dd>${qaTraceDuration(value)}</dd></div>`).join('');
+}
+
+function renderQaSearchTrace(retrieval, message = {}) {
+  const plan = retrieval.query_plan || {};
+  if (!retrieval.query_plan && !retrieval.current_task && !message.pending && !(retrieval.trace || []).length) return "";
+  const prefix = `trace:${message.id || message.turn_id || 'history'}`;
+  const task = retrieval.current_task;
+  const taskHtml = task ? `<details class="qa-sources qa-current-task" data-qa-detail="${escapeHtml(prefix + ':task')}">
+    <summary>本轮理解 · ${escapeHtml(task.request || '')}</summary>
+    <div class="qa-source"><div class="qa-source-text">${escapeHtml(task.expected_result || '')}</div>
+    ${(task.requirements || []).map(r => `<div class="qa-task-requirement"><div>${escapeHtml(({constraint:'必须遵守',priority:'判断重点',reference:'补充参考'})[r.importance] || '用户要求')} · ${escapeHtml(r.text)}</div><div class="qa-source-meta">依据用户第 ${Number(r.source_turn)} 次发言：“${escapeHtml(r.source_quote)}”</div></div>`).join('')}
+    ${task.clarification ? `<div>${escapeHtml(task.clarification)}</div>` : ''}
+    <div class="qa-source-meta">理解有误时，可在输入框直接说明需要更正的要求；更正后用于下一轮。</div></div></details>` : '';
   const people = (plan.people || []).map(p => p.name).join("、") || "全库";
-  const tools = {find_people: "查找人物", list_chats: "查找会话", shared_windows: "共同发言时间窗", timeline: "消息时间线", search: "混合搜索", hybrid_search: "混合搜索", surrounding: "展开前后文", background: "历史背景补查", statistics: "会话统计", unanswered: "未回复线索"};
-  const rows = (retrieval.trace || []).map(t => `<div class="qa-source">
-    <div class="qa-source-meta">${escapeHtml(tools[t.tool] || t.tool)} · ${Number(t.elapsed_ms || 0)} ms</div>
+  const tools = {find_people: "查找人物", list_chats: "查找会话", read_chats:"读取会话", read_messages:"读取原始消息", read_messages_batch:"批量读取消息", query_messages:"查询消息数据库", semantic_search:"语义搜索", message_context:"展开前后文", shared_windows: "共同发言时间窗", timeline: "消息时间线", search: "混合搜索", hybrid_search: "混合搜索", surrounding: "展开前后文", background: "历史背景补查", statistics: "会话统计", unanswered: "未回复线索"};
+  const steps = retrieval.trace || [];
+  const rows = steps.map((t, index) => `<details class="qa-trace-step" data-qa-detail="${escapeHtml(prefix + ':' + (t.tool_call_id || index))}">
+    <summary><span>${index + 1}. ${escapeHtml(tools[t.tool] || t.tool)}</span><span class="qa-trace-duration">${qaTraceDuration(t.elapsed_ms)}</span></summary>
+    <div class="qa-trace-step-body">
     <div>返回 ${Number(t.returned || 0)} ${t.unit === "个人物" ? "个人物" : t.unit === "个会话" ? "个会话" : "条"} · 纳入 ${Number(t.included || 0)} 条证据${t.matched == null ? "" : ` · 匹配 ${Number(t.matched)} ${t.tool === "shared_windows" ? "个候选时间窗" : t.unit === "个人物" ? "个人物" : t.unit === "个会话" ? "个会话" : "条"}`}${t.complete ? "" : " · 部分覆盖"}</div>
     ${t.anchor_count == null ? "" : `<div class="qa-source-meta">命中 ${Number(t.anchor_count)} 条 · 自动补充前后文 ${Number(t.context_count || 0)} 条</div>`}
-    ${t.parameters?.query ? `<div class="qa-source-text">${escapeHtml(t.parameters.query)}</div>` : ""}
+    ${t.retrieval_counts?.window_candidate_count == null ? "" : `<div class="qa-source-meta">候选消息 ${Number(t.retrieval_counts.message_candidate_count)} 条 → 重排窗口 ${Number(t.retrieval_counts.window_candidate_count)} 个</div>`}
+    <dl class="qa-trace-params">${qaTraceParameters(t.parameters)}</dl>
+    <dl class="qa-trace-params">${qaTraceTimings(t.timings)}</dl>
+    ${(t.rerank_batch_timings || []).length ? `<details class="qa-trace-preview" data-qa-detail="${escapeHtml(prefix + ':batches:' + (t.tool_call_id || index))}"><summary>重排批次耗时 · ${t.rerank_batch_timings.length} 批</summary>${t.rerank_batch_timings.map(b => `<div class="qa-source-meta">第 ${Number(b.batch)} 批 · ${Number(b.candidates)} ${t.retrieval_counts?.window_candidate_count == null ? '条' : '个窗口'} · ${qaTraceDuration(b.elapsed_ms)} · ${Number(b.attempts)} 次调用</div>`).join('')}</details>` : ''}
     ${t.parameters?.filters ? `<div class="qa-source-meta">${escapeHtml([
       ({group: "群聊", private: "私聊"})[t.parameters.filters.chat_type],
-      t.parameters.filters.chat_keyword && `会话名：${t.parameters.filters.chat_keyword}`,
+      (t.parameters.filters.chat_title_contains || t.parameters.filters.chat_keyword) && `名称包含：${t.parameters.filters.chat_title_contains || t.parameters.filters.chat_keyword}`,
       t.parameters.filters.since && `自 ${t.parameters.filters.since}`,
       t.parameters.filters.until && `至 ${t.parameters.filters.until}`,
     ].filter(Boolean).join(" · "))}</div>` : ""}
+    ${(t.query_results || []).length ? `<details class="qa-trace-preview" data-qa-detail="${escapeHtml(prefix + ':queries:' + (t.tool_call_id || index))}"><summary>各查询召回结果 · ${t.query_results.length} 条查询</summary>${t.query_results.map(q => `<div class="qa-source"><div>${escapeHtml(q.query)}</div><div class="qa-source-meta">语义块 ${Number(q.semantic_count)} · 全文 ${Number(q.fts_count)} · 精确匹配 ${Number(q.like_count)}</div></div>`).join('')}</details>` : ''}
     ${t.note ? `<div class="qa-source-text">${escapeHtml(t.note)}</div>` : ""}
-  </div>`).join("");
+    ${t.next_offset == null ? '' : `<div class="qa-source-meta">后续分页起点：${Number(t.next_offset)}</div>`}
+    ${(t.preview || []).length ? `<details class="qa-trace-preview" data-qa-detail="${escapeHtml(prefix + ':preview:' + (t.tool_call_id || index))}"><summary>结果预览 · ${t.preview.length}/${Number(t.preview_total || t.returned || t.preview.length)} · 每条最多 800 字符</summary>${t.preview.map(p => `<div class="qa-source"><div class="qa-source-meta">${escapeHtml([p.chat_title || p.title || p.name, p.sender, p.time].filter(Boolean).join(' · '))}</div><div class="qa-source-text">${escapeHtml(p.text || p.evidence_id || '')}</div></div>`).join('')}</details>` : ''}
+  </div></details>`).join("");
   const reviewLabels = {accept: "未发现实质问题", revise: "现有证据需重新作答", retrieve: "需要补充检索"};
   const reviews = (retrieval.answer_reviews || []).map(r => `<div class="qa-source">
-    <div class="qa-source-meta">模型复核 ${Number(r.attempt || 1)} · ${escapeHtml(reviewLabels[r.decision] || r.decision)} · ${Number(r.elapsed_ms || 0)} ms</div>
+    <div class="qa-source-meta">模型复核 ${Number(r.attempt || 1)} · ${escapeHtml(reviewLabels[r.decision] || r.decision)} · ${r.reused ? '复用相同草稿的核验结果' : qaTraceDuration(r.elapsed_ms)}</div>
     ${(r.issues || []).map(issue => `<div class="qa-source-text">${escapeHtml(issue.reason || "")}</div>`).join("")}
   </div>`).join("");
-  return `<details class="qa-sources qa-search-trace"><summary>查询过程</summary>
-    <div class="qa-source"><div class="qa-source-text">${escapeHtml(plan.query || "")}</div>
+  const active = retrieval.active_step;
+  const modelMetrics = (retrieval.model_metrics || []).map((m, i) => `<div class="qa-source-meta">模型调用 ${i + 1} · ${({review:'回答复核',task:'更新当前任务'})[m.phase] || '检索决策'} · ${qaTraceDuration(m.elapsed_ms)} · 输入 ${Number(m.prompt_tokens || 0).toLocaleString()} tokens · 请求 ${Number(m.request_chars || 0).toLocaleString()} 字符</div>`).join('');
+  const answerTimings = (retrieval.answer_timings || []).map((m, i) => `<div class="qa-source-meta">生成回答 ${i + 1} · ${qaTraceDuration(m.elapsed_ms)} · ${Number(m.source_count)} 条证据</div>`).join('');
+  const transports = retrieval.transport_calls || [];
+  const transportTimings = transports.map((m, i) => {
+    const timing = (value) => value == null ? '未收到' : qaTraceDuration(value);
+    const label = ({model:'检索决策',task:'更新任务',answer:'生成回答',review:'回答复核'})[m.phase] || '模型调用';
+    return `<div class="qa-source-meta">请求 ${i + 1} · ${label} · 首个事件 ${timing(m.first_event_ms)} · 首段内容 ${timing(m.first_content_ms)} · 完整响应 ${m.total_ms == null ? '未完成' : timing(m.total_ms)} · ${Number(m.request_chars || 0).toLocaleString()} 请求字符（含工具定义）${m.prompt_tokens == null ? '' : ` · ${Number(m.prompt_tokens).toLocaleString()} 输入 tokens`}</div>`;
+  }).join('');
+  const latestTransport = transports[transports.length - 1];
+  const streamStatus = latestTransport && latestTransport.phase === active?.phase && ['waiting','receiving'].includes(latestTransport.status)
+    ? (latestTransport.status === 'waiting' ? '等待模型响应' : `正在接收模型响应 · 已接收 ${Number(latestTransport.output_chars || 0)} 字符`) : '';
+  const phase = {task:'结合历史更新当前任务',model:'等待模型选择工具',tool:'执行工具',answer:'等待模型生成回答',review:'等待模型复核',transition:'处理进度'};
+  const current = message.pending ? `<div class="qa-trace-current" role="status">
+    <strong>${escapeHtml(phase[active?.phase] || '正在处理')}</strong>
+    <div>${escapeHtml(streamStatus || message.progress || active?.message || '等待后台进度')}</div>
+    ${active?.started_at_ms ? `<span class="qa-source-meta" data-qa-stage-start="${Number(active.started_at_ms)}">本阶段 ${qaTraceDuration(Date.now() - Number(active.started_at_ms))}</span>` : ''}
+    <dl class="qa-trace-params">${qaTraceParameters(active?.parameters)}</dl>
+  </div>` : '';
+  return taskHtml + `<details class="qa-sources qa-search-trace" data-qa-detail="${escapeHtml(prefix)}"><summary>查询过程 · ${steps.length} 步工具调用${message.pending ? ' · 进行中' : ''}</summary><div class="qa-trace-body">
+    ${current}
+    ${retrieval.query_plan ? `<div class="qa-source"><div class="qa-source-text">${escapeHtml(plan.query || "")}</div>
       <div class="qa-source-meta">对象：${escapeHtml(retrieval.scope || people)} · ${escapeHtml(retrieval.time_scope || "未限定日期")}</div>
       ${plan.clarification ? `<div>${escapeHtml(plan.clarification)}</div>` : ""}
-    </div>${rows}${reviews}${retrieval.quality_status === "unresolved" ? '<div class="qa-source">检查未通过，未发布草稿结论</div>' : ""}</details>`;
+    </div>` : ''}${rows}${reviews}${transportTimings || modelMetrics || answerTimings ? `<details class="qa-trace-preview" data-qa-detail="${escapeHtml(prefix + ':models')}"><summary>模型请求耗时与输入量</summary>${transportTimings || (modelMetrics + answerTimings)}</details>` : ''}${retrieval.coverage?.note ? `<div class="qa-source-meta qa-trace-note">${escapeHtml(retrieval.coverage.note)}</div>` : ''}${retrieval.quality_status === "unresolved" ? '<div class="qa-source">检查未通过，未发布草稿结论</div>' : ""}</div></details>`;
 }
 
 function setQaProgress(text) {
@@ -2125,6 +2211,9 @@ function updateQaElapsedNode(message) {
   if (!message?.id) return;
   const node = qaMessages.querySelector(`[data-qa-elapsed="${CSS.escape(message.id)}"]`);
   if (node) node.textContent = formatElapsed(message.elapsed_ms || elapsedForMessage(message));
+  for (const stage of qaMessages.querySelectorAll('[data-qa-stage-start]')) {
+    stage.textContent = `本阶段 ${qaTraceDuration(Date.now() - Number(stage.dataset.qaStageStart))}`;
+  }
 }
 
 function updateQaStatusNode(message) {

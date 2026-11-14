@@ -100,7 +100,7 @@ class CodeAPITests(unittest.TestCase):
 
 
 class SharedRerankBudgetTests(unittest.TestCase):
-    def run_search(self, batches):
+    def run_search(self, batches, concurrent=False):
         from wechat_agent import web, code_skill_web, platform_tools
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
             root = Path(directory)
@@ -119,10 +119,16 @@ class SharedRerankBudgetTests(unittest.TestCase):
             stack.enter_context(patch.object(web, 'effective_llm_profile', return_value={'model':'fixture'}))
             stack.enter_context(patch.object(web, 'resolve_llm_api_key', return_value='fixture'))
             paid = stack.enter_context(patch.object(web, 'call_chat_payload', return_value={
-                'usage':{'total_tokens':5},'choices':[{'finish_reason':'stop','message':{'content':'scores'}}]}))
+                'usage':{'total_tokens':5},'choices':[{'finish_reason':'stop','message':{'content':'{"text":"scores"}'}}]}))
             def search(*args, rerank_call, **kwargs):
-                for _ in range(batches):
-                    rerank_call({}, 'synthetic', [{'role':'user','content':'test'}])
+                def call(_):
+                    return rerank_call({}, 'synthetic', [{'role':'user','content':'test'}])
+                if concurrent:
+                    from concurrent.futures import ThreadPoolExecutor
+                    with ThreadPoolExecutor(max_workers=3) as pool:
+                        list(pool.map(call,range(batches)))
+                else:
+                    for i in range(batches): call(i)
                 return [], {'semantic':{'usage':{'total_tokens':3}}}
             stack.enter_context(patch.object(web, 'search_qa_search_db', side_effect=search))
             def tool(tools, plan, action, sources):
@@ -147,6 +153,10 @@ class SharedRerankBudgetTests(unittest.TestCase):
 
     def test_extra_batch_stops_before_exceeding_paid_call_budget(self):
         self.run_search(3)
+
+    def test_concurrent_batches_account_usage_without_exceeding_budget(self):
+        self.run_search(2, concurrent=True)
+        self.run_search(3, concurrent=True)
 
 
 class CodeIndexPreparationTests(unittest.TestCase):

@@ -1,4 +1,3 @@
-import copy
 import json
 import sqlite3
 import tempfile
@@ -7,7 +6,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from wechat_agent.goals import GoalStore, GoalConflict
 from wechat_agent import web
 
 

@@ -3,19 +3,30 @@ on: [push, pull_request]
 permissions:
   contents: read
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install ruff==0.17.5
+      - run: ruff check .
   test:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         timezone: [UTC, Asia/Singapore]
+        # 3.9 is the declared minimum in pyproject.toml; 3.11 is the main target.
+        python-version: ['3.9', '3.11']
     env:
       TZ: ${{ matrix.timezone }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: ${{ matrix.python-version }}
       - uses: actions/setup-node@v4
         with:
           node-version: '22'

@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import time
 from contextlib import contextmanager
 
 from .evidence_context import merge_evidence
@@ -70,6 +71,8 @@ class ConversationTools:
             filters.append('instr(lower(chat_title),lower(?)) > 0'); params.append(scope['keyword'])
         if plan.get('chat_ids'):
             filters.append('chat_id IN ('+','.join('?' for _ in plan['chat_ids'])+')'); params.extend(plan['chat_ids'])
+        from .query_exclusions import add_exclusion_filters
+        add_exclusion_filters(filters, params, plan)
         ids = [p["id"] for p in plan.get("people", [])]
         if ids:
             # 明确群聊范围时按发送者筛选；其余范围沿用索引中的联系人归属。
@@ -158,12 +161,23 @@ class ConversationTools:
         self.check()
         retrieval_plan = dict(plan, query=query or plan["query"])
         filters, params = self.filters(plan)
+        title = (plan.get('chat_scope') or {}).get('keyword','')
+        if title:
+            with self.connection() as conn:
+                scoped_chats = conn.execute('SELECT count(DISTINCT chat_id) FROM messages WHERE '+
+                                           ' AND '.join(filters),params).fetchone()[0]
+            if not scoped_chats:
+                return {'tool':'hybrid_search','items':[],'matched':0,'complete':False,
+                    'scope_diagnostics':{'chat_title_contains':title,'matching_chats':0,'body_search_executed':False},
+                    'error':{'code':'empty_chat_scope','retryable':True},
+                    'note':'当前会话名称及其他范围条件匹配0个会话，未执行正文搜索。chat_title_contains只匹配名称的整段文字；请核对用户是否指定名称范围，内容查询应放在query/queries。未自动放宽条件。'}
         since = plan.get("since_ts")
         if self.state.since_ts is not None:
             since = max(since, self.state.since_ts) if since is not None else self.state.since_ts
         until = plan["until_ts"]
         hits, diagnostics = self.hybrid(retrieval_plan["query"], plan.get("people", []), since, until, size,
                                         scope=plan)
+        hydrate_started = time.monotonic()
         ids = []
         with self.connection() as conn:
             for hit in hits:
@@ -190,7 +204,9 @@ class ConversationTools:
         note = "相关性检索，不代表穷尽时间范围内全部消息"
         if diagnostics.get('rerank_error'):
             note += '；重排未完成，使用已有排序：'+diagnostics['rerank_error']
-        anchors = items[:size]
+        # Ranked windows are intact; the final window may cross the message
+        # target so its last line (often the actual answer) is not discarded.
+        anchors = items if diagnostics.get('rerank_unit')=='conversation_window' else items[:size]
         # size counts search hits, not their neighbours. Enrich after ranking so
         # short replies retain their subject without spending another model turn.
         nearby = self.surrounding(plan, anchors, max(1, len(anchors)*CONTEXT_MAX_ROWS*2))
@@ -199,7 +215,13 @@ class ConversationTools:
         for anchor in anchors:
             key = anchor['evidence_id']
             by_id[key]['context_ids'] = nearby.get('context_links', {}).get(key, [])
+        diagnostics.setdefault('timings', {})['context_expansion_ms'] = round((time.monotonic()-hydrate_started)*1000)
+        scope_diagnostics = {'chat_title_contains':title,'body_search_executed':True,
+                             'query_count':len(plan.get('queries') or [retrieval_plan['query']]),'message_hits':len(items)}
+        if not items:
+            note += '；当前正文查询未命中。可检查名称、时间、人物范围或换用不同角度的内容查询；零命中不表示相关内容不存在。'
         return {"items": enriched, "matched": len(items), "complete": False, "tool": "hybrid_search",
+                'scope_diagnostics':scope_diagnostics,
                 "anchor_count": len(anchors), "context_count": len(enriched)-len(anchors),
                 "note": note+'；附带同会话30分钟内的前后文，各3条起并补齐边界同人连续发言，最多各12条；相邻不代表同一话题或直接回复',
                 "diagnostics": diagnostics}
@@ -222,12 +244,16 @@ class ConversationTools:
                 bounds=seed.get('retrieval_bounds') or {}
                 lower=max(self.state.since_ts or 0, plan.get('since_ts') or 0, bounds.get('since_ts') or 0)
                 upper=min(plan['until_ts'],bounds.get('until_ts') or plan['until_ts'])
+                from .query_exclusions import add_exclusion_filters
+                exclusions, exclusion_params = [], []
+                add_exclusion_filters(exclusions, exclusion_params, plan)
+                exclusion_sql = (' AND '+' AND '.join(exclusions)) if exclusions else ''
                 for direction, order in (("<", "DESC"), (">", "ASC")):
                     rows = conn.execute(
                         f"SELECT * FROM messages WHERE chat_id=? AND timestamp >= ? AND timestamp <= ? "
-                        f"AND (timestamp, id) {direction} (?, ?) ORDER BY timestamp {order}, id {order} LIMIT ?",
-                        (seed["chat_id"], max(lower, seed["timestamp"] - 1800),
-                         min(upper, seed["timestamp"] + 1800), seed["timestamp"], seed["index_row_id"], CONTEXT_MAX_ROWS),
+                        f"AND (timestamp, id) {direction} (?, ?) {exclusion_sql} ORDER BY timestamp {order}, id {order} LIMIT ?",
+                        [seed["chat_id"], max(lower, seed["timestamp"] - 1800),
+                         min(upper, seed["timestamp"] + 1800), seed["timestamp"], seed["index_row_id"], *exclusion_params, CONTEXT_MAX_ROWS],
                     ).fetchall()
                     for row in context_turn(rows):
                         item = self.item(row, "surrounding")

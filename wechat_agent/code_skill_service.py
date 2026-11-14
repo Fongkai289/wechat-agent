@@ -16,6 +16,7 @@ from .code_skill_packages import package_hash, validate_package
 from .code_skill_runtime import run_package
 from .goal_checkpoints import checkpoint_session
 from .goals import validate_goal_result, GoalCancelled
+from .model_output import parse_structured_completion
 
 
 def generate_code_skill(prompt, completion, store, goal_id, model, emit, revision=None, notes='', availability=None):
@@ -45,8 +46,7 @@ def generate_code_skill(prompt, completion, store, goal_id, model, emit, revisio
         choice = (response.get('choices') or [{}])[0]
         content = (choice.get('message') or {}).get('content') or ''
         try:
-            if choice.get('finish_reason') not in ('stop',None): raise ValueError('代码包输出被截断')
-            skill = validate_package(json.loads(content))
+            skill = validate_package(parse_structured_completion(response, PACKAGE_FORMAT))
             skill['files'] = [f for f in skill['files'] if f['path']!='PLATFORM_API.md'] + [{'path':'PLATFORM_API.md','content':API_DOC}]
             skill['files'] = [f for f in skill['files'] if f['path']!='CAPABILITIES.json'] + [{'path':'CAPABILITIES.json','content':json.dumps(capability_report,ensure_ascii=False,indent=2)}]
             # 测试前保存草稿，失败时仍可查看和修改；附带文档以平台契约为准。
@@ -175,6 +175,8 @@ def run_code_skill(goal, api, report, cancelled, model, preparation_time=lambda:
     api.report = publish
     builder = StateGraph(dict)
     with checkpoint_session(goal.get('checkpoint_path')) as (saver, receipts), tracing_context(enabled=False):
+        from .qa_recovery import CallReceipts
+        nested_receipts = CallReceipts(receipts.conn, bool(goal.get('confirm_retry')))
         position = 0
         def dispatch(method, arguments):
             nonlocal position
@@ -184,7 +186,9 @@ def run_code_skill(goal, api, report, cancelled, model, preparation_time=lambda:
             counts = {k:len(getattr(api,k)) for k in ('sources','steps')}
             # 消息账本、引用和步骤只存本次增量，其余计数及暂存状态保留完整快照。
             def perform():
-                value = api.dispatch(method,arguments)
+                # A failed search can resume its completed embedding/rerank batches.
+                with nested_receipts.scope(f'skill:{position}:{digest}'):
+                    value = api.dispatch(method,arguments)
                 snapshot = api.snapshot()
                 snapshot['ledger'] = [v for k,v in api.ledger.items() if before_ledger.get(k)!=v]
                 for key,n in counts.items(): snapshot[key] = snapshot[key][n:]

@@ -62,7 +62,7 @@ def checkpoint_session(path=None):
         fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
         os.close(fd)
     conn = sqlite3.connect(str(path) if path else ':memory:', check_same_thread=False, timeout=30)
-    receipts_conn = sqlite3.connect(str(path), timeout=30) if path else conn
+    receipts_conn = sqlite3.connect(str(path), timeout=30, check_same_thread=False) if path else conn
     try:
         saver = RecentSqliteSaver(conn)
         saver.setup()

@@ -10,7 +10,14 @@ browser, indexer, query planner, background jobs and model configuration.
 | Synthetic import | `wechat_agent/demo.py` | Isolated, idempotent import of authored JSON fixtures |
 | Chat browser | `wechat_agent/message_pages.py`, `web/sidebar.js` | Cursor pagination, shard merge and sidebar layout |
 | Web and retrieval | `wechat_agent/web.py` | HTTP routes, normalization, contact signals, FTS/LIKE, semantic chunks, RRF and answer generation |
+| Semantic vectors | `wechat_agent/semantic_vectors.py` | Normalized embedding matrices cached per index version; one NumPy matrix product per query |
+| Message display | `wechat_agent/message_display.py` | Readable text for XML/app/system/VoIP/forwarded messages and local media lookup |
+| Model settings | `wechat_agent/llm_config.py` | Profile defaults, normalization, key masking and a change-aware config cache |
+| Saved conversations | `wechat_agent/qa_store.py` | Q&A history in SQLite (one row per message); imports the legacy JSON store once |
 | Q&A citation contract | `wechat_agent/qa_answers.py` | Strict answer schema, reference validation and plain-text compatibility |
+| Retrieval execution | `wechat_agent/retrieval_execution.py`, `wechat_agent/qa_context.py` | Three-batch bounded reranking, durable batch identities, compact decision evidence and timing |
+| Retrieval windows | `wechat_agent/retrieval_windows.py` | Score bounded conversation windows once, then expand selected original messages intact |
+| Conversation task | `wechat_agent/qa_task.py` | Persist the current request and user-backed requirements across follow-ups; share them with retrieval, answering and review |
 | Background work | `wechat_agent/jobs.py`, `web/jobs.js` | Job state, progress, cancellation and browser reconnect |
 | Recurring assistant | `wechat_agent/goals.py`, `wechat_agent/code_skill_web.py` | Schedule, editable code Skills, shared tools and source validation |
 | Shared platform | `wechat_agent/platform_api.py`, `wechat_agent/platform_runtime.py`, `wechat_agent/platform_data_tools.py` | Common raw reads, scoped SQL, retrieval, model service and provenance; Python/native adapters |
@@ -29,12 +36,23 @@ person, conversation and date filters apply before recall and ranking; they do
 not persist into the next query. Fixed task/data boundaries remain enforced.
 
 `search_qa_search_db` fuses semantic and keyword candidates with equal-weight RRF
-and reranks all recalled candidates in API batches, without business
+and groups recalled messages into conversation windows before API reranking, without business
 heuristic scoring. Query reformulation belongs to the tool loop. Q&A and Skills
 use the same platform runtime, including raw-message reads, custom read-only SQL,
 threshold semantic search, index preparation and model transport. Older interrupted
 Q&A protocols cannot resume; saved conversations remain readable. See
 [Conversational Search](CONVERSATIONAL_SEARCH.md) for protocols and limits.
+
+Reranking runs at most three batches concurrently per search. All candidates are
+still scored, ties retain the fused order, and completed model responses have
+durable batch-scoped receipts shared by Q&A and Skills. Unknown outcomes require
+explicit retry consent; in-flight requests finish before receipt connections
+close. Old serial receipts resume with their original call IDs.
+
+Decision input has one evidence catalog and numeric context-window references,
+instead of repeating long evidence links in every historical tool result.
+This reduces transport duplication without deleting evidence. Diagnostics record
+retrieval stages, rerank batches, model input size and wall-clock duration.
 
 ## Answer Provenance
 

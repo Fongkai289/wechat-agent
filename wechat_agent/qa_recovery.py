@@ -7,15 +7,16 @@ import inspect
 import json
 import re
 import sqlite3
+import threading
 from contextlib import closing, contextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from pathlib import Path
 
 from .goal_checkpoints import GoalResumeRequired, checkpoint_info, remove_checkpoint
 
 
 _scope = ContextVar('qa_receipts', default=None)
-AGENT_VERSION = 9
+AGENT_VERSION = 13
 
 
 def checkpoint_path(store, turn_id):
@@ -76,6 +77,7 @@ class CallReceipts:
     # 图检查点保存执行位置，调用回执保存工具/API 结果，两者配合缩小崩溃后重复执行的窗口。
     def __init__(self, conn, allow_retry=False):
         self.conn = conn
+        self.lock = threading.RLock()
         with conn:
             conn.execute('''CREATE TABLE IF NOT EXISTS qa_calls(
                 id TEXT PRIMARY KEY, status TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '',
@@ -93,21 +95,45 @@ class CallReceipts:
 
     def call(self, key, invoke, billable):
         # done 可直接复用；pending 只能说明请求已开始，不能证明远端没有执行或计费。
-        row = self.conn.execute('SELECT status,payload,uncertain_attempts FROM qa_calls WHERE id=?', (key,)).fetchone()
-        if row and row[0] == 'done':
-            return json.loads(row[1])
-        if row and billable and key not in self.approved:
-            raise GoalResumeRequired('上次模型请求结果未知，可能已计费；请确认后重试该请求')
-        unknown = int(row[2]) + int(billable) if row else 0
-        self.approved.discard(key)
-        # 先落 pending 再发请求，收到结果先落 done 再推进图；远端 exactly-once 无法由本地保证。
-        with self.conn:
+        # Only SQLite transactions are serialized; network calls run outside the lock.
+        with self.lock, self.conn:
+            row = self.conn.execute('SELECT status,payload,uncertain_attempts FROM qa_calls WHERE id=?', (key,)).fetchone()
+            if row and row[0] == 'done':
+                return json.loads(row[1])
+            if row and billable and key not in self.approved:
+                raise GoalResumeRequired('上次模型请求结果未知，可能已计费；请确认后重试该请求')
+            unknown = int(row[2]) + int(billable) if row else 0
+            self.approved.discard(key)
             self.conn.execute("INSERT OR REPLACE INTO qa_calls VALUES(?, 'pending', '', ?, ?)", (key, int(billable), unknown))
         with self.scope(key):
             result = invoke()
-        with self.conn:
+        with self.lock, self.conn:
             self.conn.execute("UPDATE qa_calls SET status='done',payload=? WHERE id=?", (json.dumps(result, ensure_ascii=False), key))
         return result
+
+
+def bind_receipt_branch(name, invoke):
+    """Give a concurrent batch a stable namespace, not a shared mutable counter."""
+    context, scope = copy_context(), _scope.get()
+    def run():
+        if scope is None:
+            return invoke()
+        receipts, parent, _ = scope
+        with receipts.scope(parent + '/branch:' + name):
+            return invoke()
+    return lambda: context.run(run)
+
+
+def has_serial_model_receipts():
+    """Finish pre-concurrency checkpoints using their original positional IDs."""
+    scope = _scope.get()
+    if scope is None:
+        return False
+    receipts, parent, _ = scope
+    with receipts.lock:
+        rows = receipts.conn.execute('SELECT id FROM qa_calls WHERE substr(id,1,?)=?',
+                                     (len(parent) + 1, parent + '/')).fetchall()
+    return any(re.match(r'\d+:call_chat_payload:', row[0][len(parent)+1:]) for row in rows)
 
 
 def recorded_call(name, invoke, billable=False, fingerprint=''):

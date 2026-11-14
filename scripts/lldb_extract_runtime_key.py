@@ -5,7 +5,6 @@ import argparse
 import hashlib
 import hmac
 import json
-import os
 import struct
 import sys
 import time

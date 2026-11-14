@@ -14,7 +14,8 @@ from .skill_tool_calling import validate_messages
 from .platform_data_tools import DATA_TOOLS
 from .qa_tools import evidence_id
 from .evidence_context import merge_evidence
-from .platform_sql import SQLSnapshot
+from .platform_sql import SQLSnapshot, SQLScopeError
+from .model_ids import ModelIDs
 
 COLUMNS = 'id chat_id chat_title chat_type timestamp time sender sender_username text type source_db source_table local_id server_id person_id person_name'.split()
 FUNCTIONS = set('abs coalesce ifnull nullif lower upper length substr substring instr like glob replace trim ltrim rtrim printf round min max sum avg count total group_concat row_number rank dense_rank lag lead first_value last_value nth_value ntile percent_rank cume_dist datetime date time strftime julianday unixepoch typeof cast'.split())
@@ -215,7 +216,14 @@ class PlatformAPI:
             self.model_calls+=1
             if self.embedding_calls>self.limits['max_embedding_calls'] or self.model_calls>self.limits['max_llm_calls']:
                 raise ValueError('共享检索的 Embedding/重排调用预算已用完')
-        result = self.execute_data(name, action['arguments'], sources) if name in DATA_TOOLS else self.tool_backend(plan,action,sources)
+        try:
+            result = self.execute_data(name, action['arguments'], sources) if name in DATA_TOOLS else self.tool_backend(plan,action,sources)
+        except SQLScopeError as exc:
+            # Share recoverable local errors across Q&A and Skill tool callers.
+            # Paid timeouts, permission errors and invalid scores still propagate.
+            result = {'tool':name, 'items':[], 'matched':None, 'complete':False, 'next_offset':None,
+                      'error':{'code':'sql_scope_too_large','retryable':True,'message':str(exc)},
+                      'note':str(exc)+'。可改用 statistics/search，或分时间窗查询并说明覆盖范围；不能将失败解释为没有相关消息。'}
         items=[]
         for item in result.get('items',[]):
             if item.get('evidence_role')=='statistics':
@@ -308,12 +316,14 @@ class PlatformAPI:
         if definitions is None:
             value, usage = self.backends['llm'](messages,schema)
         else:
-            value, usage = self.backends['llm'](messages,schema,tools=definitions,tool_choice=tool_choice)
+            identities = ModelIDs(self.available_sources(), self.tool_observations)
+            value, usage = self.backends['llm'](identities.messages(messages),schema,
+                tools=identities.definitions(definitions),tool_choice=tool_choice)
             self.add_usage(usage,'llm')
             if not isinstance(value,dict): raise ValueError('模型工具响应格式无效')
             if value.get('finish_reason')=='tool_calls':
                 if tool_choice=='none': raise ValueError('本轮禁止工具调用，但模型仍返回了工具指令')
-                _,assistant=parse_tool_call({'choices':[value]},self.available_sources(),self.tool_observations,self.tool_plan(),messages)
+                _,assistant=parse_tool_call(identities.decode_response({'choices':[value]}),self.available_sources(),self.tool_observations,self.tool_plan(),messages)
                 if assistant['tool_calls'][0]['function']['name'] not in tools: raise ValueError('模型调用了未提供的工具')
                 value={**value,'message':assistant}
             elif value.get('finish_reason')!='stop' or tool_choice=='required':

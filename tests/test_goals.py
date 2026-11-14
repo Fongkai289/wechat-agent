@@ -1,4 +1,3 @@
-import copy
 import json
 import io
 import sqlite3
@@ -7,10 +6,9 @@ import threading
 import unittest
 import urllib.error
 from pathlib import Path
-from datetime import datetime
 from unittest.mock import Mock, patch
 
-from wechat_agent.goals import GoalStore, GoalScheduler, GoalConflict, GoalCancelled, GoalReferenceError, GoalCoverageError, observation_window, GOAL_RESULT_FORMAT, validate_goal_result
+from wechat_agent.goals import GoalStore, GoalScheduler, GoalConflict, GoalCancelled, GOAL_RESULT_FORMAT, validate_goal_result
 from wechat_agent import web
 
 
@@ -392,6 +390,7 @@ class GoalAPITests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         root=Path(self.temp.name)
         state=web.AppState(**{key:root/key for key in ('db_storage','decrypted','keys','media_root','voice_cache','llm_config','qa_store','qa_index_cache','qa_search_db')})
+        self.state = state
         with patch.object(web.threading.Thread,'start'):
             self.handler_class=web.make_handler(state)
         self.handler=self.handler_class.__new__(self.handler_class)
@@ -442,6 +441,54 @@ class GoalAPITests(unittest.TestCase):
             self.assertEqual(self.handler_class.goal_scheduler.execute(goal, Mock(), lambda:False), 'done')
         self.assertIs(run.call_args.args[2], goal)
 
+    def test_saved_skill_crosses_scheduler_entrypoint_for_manual_scheduled_and_resume(self):
+        from tests.test_code_skills import package
+        from wechat_agent.code_skill_service import setup, check_key
+        scheduler = self.handler_class.goal_scheduler
+        store = scheduler.store
+        self.state.account = 'self'
+        skill = package()
+        prompt = 'Check synthetic messages'
+        with store.connect() as conn:
+            setup(conn)
+            conn.execute('INSERT INTO code_skill_checks VALUES(?,?)',
+                         (check_key(skill,prompt),json.dumps({'passed':True})))
+        goal_id = store.save({'title':'Fixture','prompt':prompt,'cadence':'hourly','enabled':True,
+                             'skill':skill,'skill_prompt':prompt},now=100)
+        for index, mode in enumerate(('manual','scheduled','resume_string','resume_object')):
+            with self.subTest(mode=mode):
+                now = 200 + index*4000
+                goal = store.claim_due(now) if mode=='scheduled' else store.claim_manual(goal_id,now=now)
+                self.assertIsInstance(goal['skill'],str)
+                if mode.startswith('resume'):
+                    with store.connect() as conn:
+                        goal = json.loads(conn.execute('SELECT goal_snapshot FROM goal_runs WHERE id=?',
+                                                       (goal['run_id'],)).fetchone()[0])
+                    goal['resume'] = True
+                    if mode=='resume_object':
+                        goal['skill'] = json.loads(goal['skill'])
+                runtime = Mock()
+                with patch('wechat_agent.code_skill_web.create_platform_runtime',return_value=runtime), \
+                     patch('wechat_agent.code_skill_web.run_code_skill',return_value='Done') as run:
+                    self.assertEqual(scheduler.execute(goal,Mock(),lambda:False),'Done')
+                self.assertEqual(run.call_args.args[0]['skill'],skill)
+                runtime.api.close.assert_called_once()
+                store.finish(goal,'completed','Done',now=now+1)
+
+    def test_scheduler_still_rejects_invalid_or_untested_saved_packages(self):
+        from tests.test_code_skills import package
+        self.state.account = 'self'
+        scheduler = self.handler_class.goal_scheduler
+        for skill, expected in [('{}','无效的代码 Skill 包'),
+                                (json.dumps(package()),'请先测试 Skill')]:
+            with self.subTest(expected=expected), \
+                 patch('wechat_agent.code_skill_web.create_platform_runtime') as runtime:
+                goal = {'id':'fixture','started_at':1000,'skill':skill,'skill_version':1,
+                        'prompt':'Test','range_type':'recent_days','range_value':1,'range_unit':'days'}
+                with self.assertRaisesRegex(ValueError,expected):
+                    scheduler.execute(goal,Mock(),lambda:False)
+                runtime.assert_not_called()
+
 
 class GoalSnapshotTests(unittest.TestCase):
     def test_bounded_reader_filters_dates_and_merges_shards_without_changing_default(self):
@@ -487,7 +534,7 @@ class GoalModelRequestTests(unittest.TestCase):
         for error in (TimeoutError('The read operation timed out'), urllib.error.URLError(TimeoutError('timeout'))):
             with self.subTest(error=type(error).__name__), patch.object(web.urllib.request,'urlopen',side_effect=error) as send:
                 with self.assertRaisesRegex(TimeoutError, '300 秒'):
-                    web.call_chat_payload({'base_url':'https://api.example.test','model':'fixture'},'fixture-only-key',[],timeout=300,tools=[])
+                    web.call_chat_payload({'base_url':'https://api.example.test','model':'fixture'},'fixture-only-key',[],timeout=300)
                 self.assertEqual(send.call_count, 1)
 
     def test_timeout_while_reading_response_is_also_reported(self):
@@ -496,14 +543,15 @@ class GoalModelRequestTests(unittest.TestCase):
         response_context = Mock(__enter__=Mock(return_value=response_stream), __exit__=Mock(return_value=False))
         with patch.object(web.urllib.request, 'urlopen', return_value=response_context) as send:
             with self.assertRaisesRegex(TimeoutError, '300 秒'):
-                web.call_chat_payload({'base_url':'https://api.example.test','model':'fixture'},'fixture-only-key',[],timeout=300,tools=[])
+                web.call_chat_payload({'base_url':'https://api.example.test','model':'fixture'},'fixture-only-key',[],timeout=300)
             self.assertEqual(send.call_count, 1)
 
     def test_tool_calls_use_existing_profile_without_unsupported_temperature(self):
         payload=response('search_messages',{'query':'intern'})
         profile={'base_url':'https://api.example.test/v1','model':'configured-model','temperature':0.2}
         with patch.object(web.urllib.request,'urlopen',return_value=io.BytesIO(json.dumps(payload).encode())) as send:
-            result=web.call_chat_payload(profile,'fixture-only-key',[{'role':'user','content':'goal'}],tools=[{'type':'function'}],tool_choice='required',response_format=GOAL_RESULT_FORMAT)
+            from wechat_agent.platform_tools import FUNCTION_TOOLS
+            result=web.call_chat_payload(profile,'fixture-only-key',[{'role':'user','content':'goal'}],tools=FUNCTION_TOOLS,tool_choice='required',response_format=GOAL_RESULT_FORMAT)
         body=json.loads(send.call_args.args[0].data)
         self.assertEqual(body['model'],'configured-model')
         self.assertEqual(body['tool_choice'],'required')
@@ -515,16 +563,17 @@ class GoalModelRequestTests(unittest.TestCase):
         self.assertTrue(body['response_format']['json_schema']['strict'])
 
     def test_existing_text_completion_remains_compatible(self):
-        with patch.object(web.urllib.request,'urlopen',return_value=io.BytesIO(json.dumps(response(text='answer')).encode())) as send:
+        with patch.object(web.urllib.request,'urlopen',return_value=io.BytesIO(json.dumps(response(text='{"text":"answer"}')).encode())) as send:
             result=web.call_chat_completion({'base_url':'https://api.example.test/v1','model':'existing'},'fixture-only-key',[])
         self.assertEqual(result,'answer')
-        self.assertNotIn('response_format', json.loads(send.call_args.args[0].data))
+        self.assertTrue(json.loads(send.call_args.args[0].data)['response_format']['json_schema']['strict'])
 
     def test_goal_api_error_does_not_persist_remote_error_body(self):
         error=urllib.error.HTTPError('https://api.example.test',400,'bad request',{},io.BytesIO(b'sensitive remote body'))
         with patch.object(web.urllib.request,'urlopen',side_effect=error):
             with self.assertRaises(RuntimeError) as raised:
-                web.call_chat_payload({'base_url':'https://api.example.test','model':'existing'},'fixture-only-key',[],tools=[],response_format=GOAL_RESULT_FORMAT)
+                from wechat_agent.platform_tools import FUNCTION_TOOLS
+                web.call_chat_payload({'base_url':'https://api.example.test','model':'existing'},'fixture-only-key',[],tools=FUNCTION_TOOLS,response_format=GOAL_RESULT_FORMAT)
         self.assertIn('400',str(raised.exception))
         self.assertIn('Structured Outputs',str(raised.exception))
         self.assertNotIn('sensitive',str(raised.exception))

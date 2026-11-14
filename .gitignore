@@ -37,6 +37,7 @@ docs/images/sources-live.png
 docs/images/tasks.png
 
 # Logs and generated output
+web/.*-preview.html
 logs/
 work/vendor/
 tools/find_all_keys_macos

@@ -51,6 +51,37 @@ EXTRACT_SCHEMA = {
 }
 
 
+def extraction_schema(allowed_refs: Set[int]) -> Dict[str, Any]:
+    """Bind output citations to the evidence actually supplied in this batch."""
+    if any(type(ref) is not int or ref <= 0 for ref in allowed_refs):
+        raise RuntimeError('引用集合必须为正整数')
+    schema = json.loads(json.dumps(EXTRACT_SCHEMA))
+    jobs = schema['properties']['jobs']
+    refs = sorted(allowed_refs)
+    if not refs:
+        # Empty enum is invalid JSON Schema; no evidence means no cited findings.
+        jobs['maxItems'] = 0
+        return schema
+    reference = {'type': 'integer', 'enum': refs}
+    if len(refs) > 1000:
+        # Structured Outputs limits enum size. Exact contiguous runs retain all
+        # references without allowing numbers in the gaps or truncating evidence.
+        ranges = []
+        start = end = refs[0]
+        for ref in refs[1:]:
+            if ref == end + 1:
+                end = ref
+            else:
+                ranges.append({'type': 'integer', 'minimum': start, 'maximum': end})
+                start = end = ref
+        ranges.append({'type': 'integer', 'minimum': start, 'maximum': end})
+        reference = {'anyOf': ranges}
+    jobs['items']['properties']['source_refs'] = {
+        'type': 'array', 'minItems': 1, 'items': reference,
+    }
+    return schema
+
+
 def run(api) -> Dict[str, Any]:
     context = getattr(api, 'context', {})
     task = context.get('task') or '帮我看一下有没有新的实习信息'
@@ -230,7 +261,7 @@ def run(api) -> Dict[str, Any]:
                 if type(ref) is not int:
                     raise RuntimeError('source_refs 中含非整数元素')
                 if ref not in allowed_refs:
-                    raise RuntimeError('source_refs 中含不属于本批引用集合的引用（非法引用）')
+                    raise RuntimeError(f'第 {batch_idx}/{len(batches)} 批 source_refs 含非法引用 {ref}：本批未提供该编号，未保存为成功结果')
             out.append(j)
         return out
 
@@ -311,7 +342,7 @@ def run(api) -> Dict[str, Any]:
             api.log(f"调用 api.llm 第 {llm_calls} 次（批次 {batch_idx}/{len(batches)}） tool_choice={tool_choice}")
 
             available_tools = ['search'] if needs_retry_search else SHARED_TOOLS
-            llm_result = api.llm(history, schema=EXTRACT_SCHEMA, tools=available_tools, tool_choice=tool_choice)
+            llm_result = api.llm(history, schema=extraction_schema(allowed_refs), tools=available_tools, tool_choice=tool_choice)
             if not isinstance(llm_result,dict) or not isinstance(llm_result.get('message'),dict):
                 raise RuntimeError('模型未返回原生消息结构')
             assistant_msg=llm_result['message']

@@ -205,12 +205,20 @@ class SharedRuntimeTests(unittest.TestCase):
                            {'kind':'answer','text':'Alice asked about the schedule.','source_refs':[1]}]})}}]},
                        completion({'checks':[{'paragraph_index':1,'status':'supported',
                            'reason':'Matches original message','source_refs':[1]}],
-                           'coverage':{'status':'covered','reason':'Question answered'}})]
+                           'coverage':{'status':'covered','reason':'Question answered'},
+                           'task_checks':{key:{'status':'satisfied','reason':'Task checked'} for key in ('request','expected_result')}})]
+            def transport(*args, **kwargs):
+                from wechat_agent.model_stream import report_transport
+                index = 4-len(responses)
+                report_transport({'request_id':str(index),'status':'waiting','request_chars':100})
+                report_transport({'request_id':str(index),'status':'completed','request_chars':100,
+                                  'first_event_ms':100,'first_content_ms':200,'total_ms':300})
+                return responses.pop(0)
             with patch.object(web,'load_llm_config',return_value=config), \
                  patch.object(web,'load_or_build_qa_index',return_value={'message_count':5}), \
                  patch.object(web,'qa_search_db_status',return_value={'ready':True}), \
                  patch.object(web,'effective_llm_profile',return_value={}), \
-                 patch.object(web,'call_chat_payload',side_effect=responses) as paid, \
+                 patch.object(web,'call_chat_payload',side_effect=transport) as paid, \
                  patch.object(web,'build_or_update_qa_semantic_index',side_effect=AssertionError('SQL must not embed')):
                 with patch.object(web.threading.Thread,'start'):
                     handler_class=web.make_handler(state)
@@ -220,11 +228,17 @@ class SharedRuntimeTests(unittest.TestCase):
                                      lambda event,**data:events.append((event,data)))
             self.assertEqual(events[-1][0],'done',events[-1])
             self.assertEqual(paid.call_count,4)
+            # Verify the actual HTTP orchestration path, including answer and
+            # review, rather than only the PlatformModel constructor default.
+            self.assertEqual([call.kwargs['timeout'] for call in paid.call_args_list], [180]*4)
             stored=web.get_qa_conversation(state.qa_store,'fixture')['messages'][-1]
             self.assertEqual(stored['sources'][0]['chat_id'],'alice')
             self.assertEqual(stored['sources'][0]['evidence_role'],'primary')
             self.assertEqual(stored['retrieval']['trace'][0]['parameters']['tool'],'query_messages')
             self.assertEqual(stored['retrieval']['quality_status'],'reviewed')
+            self.assertEqual(len(stored['retrieval']['transport_calls']),4)
+            self.assertEqual(stored['retrieval']['transport_calls'][-1]['total_ms'],300)
+            self.assertTrue(any(data.get('message')=='已发送请求，等待模型响应' for event,data in events))
 
     def test_same_factory_handles_qa_and_task_raw_reads_without_models(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -245,6 +259,41 @@ class SharedRuntimeTests(unittest.TestCase):
                     self.assertEqual(rows[0]['sender_username'],'alice')
                     self.assertTrue(reader.call_args.kwargs['include_empty'])
                     self.assertEqual(runtime.model.profile['model'],name)
+                    self.assertEqual(runtime.model.timeout, web.GOAL_MODEL_TIMEOUT_SECONDS if name=='task' else 180)
+
+    def test_runtime_semantic_search_uses_own_query_for_both_profiles_and_entries(self):
+        # Exercise the real runtime callback: synthetic_api alone bypasses this
+        # adapter and cannot catch accidental references to hybrid's scope.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = web.AppState(**{k:root/k for k in (
+                'db_storage','decrypted','keys','media_root','voice_cache',
+                'llm_config','qa_store','qa_index_cache','qa_search_db')})
+            state.account = 'self'
+            sqlite3.connect(state.qa_search_db).close()
+            context = {'task':'find information','since':100,'until':1000,
+                       'account':'self','dry_run':False}
+            fixture = synthetic_api(package())
+            config = {'qa':{'model':'qa'},'task':{'model':'task'},'embedding':{}}
+            with patch.object(web,'effective_llm_profile',return_value={}), \
+                 patch.object(web,'resolve_llm_api_key',return_value='synthetic'), \
+                 patch.object(web,'call_embeddings',return_value=([[1.,0.]],{'total_tokens':2})) as embed, \
+                 patch.object(web,'qa_search_db_status',return_value={'ready':True}), \
+                 patch.object(web,'qa_embedding_index_status',return_value={'ready':True}), \
+                 patch.object(web,'query_qa_semantic_index',return_value=([],{'ready':True})) as search:
+                for profile in ('qa','task'):
+                    for entry in ('direct','tool'):
+                        with self.subTest(profile=profile,entry=entry):
+                            runtime = create_platform_runtime(state,context,fixture.limits,config,
+                                profile,lambda:None,threading.Lock(),prepare=Mock())
+                            if entry == 'tool':
+                                runtime.api.api_tool('semantic_search',native_args('semantic_search',query='portfolio advice'))
+                            else:
+                                runtime.api.dispatch('semantic_search',{'query':'portfolio advice','min_similarity':.25})
+                            self.assertEqual(embed.call_args.args[2],['portfolio advice'])
+                            self.assertEqual(search.call_args.args[3:6],
+                                (100,None,{'queries':[{'text':'portfolio advice'}],'time_until':1000}))
+                            self.assertEqual(search.call_args.kwargs['query_embedding']['vectors'],[[1.,0.]])
 
     def test_model_boundary_uses_profile_without_exposing_key(self):
         payload={'choices':[{'finish_reason':'stop','message':{'content':'{"ok":true}'}}],'usage':{'total_tokens':4}}

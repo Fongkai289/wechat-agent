@@ -13,7 +13,7 @@ FakeAPI 测试：覆盖以下场景
 """
 
 import json
-from workflow import run, BATCH_CHAR_LIMIT, MAX_EMBEDDING_CALLS
+from workflow import run, extraction_schema, EXTRACT_SCHEMA, BATCH_CHAR_LIMIT
 
 class FakeAPI:
     def __init__(self):
@@ -150,6 +150,19 @@ class FakeAPI:
 
     # api.llm simulates native tool-calling behavior based on internal mode and invocation count
     def llm(self, messages, schema=None, tools=None, tool_choice='auto'):
+        # Assert the actual request is constrained, not just the final validator.
+        refs = set()
+        for message in messages:
+            if message['role'] == 'user':
+                for line in message['content'].splitlines():
+                    if line.startswith('[#'):
+                        refs.add(int(line.split(']', 1)[0][2:]))
+            elif message['role'] == 'tool':
+                refs.update(item['reference'] for item in json.loads(message['content']).get('items', []))
+        if refs:
+            assert schema['properties']['jobs']['items']['properties']['source_refs']['items']['enum'] == sorted(refs)
+        else:
+            assert schema['properties']['jobs']['maxItems'] == 0
         response=self._response(messages,schema,tools,tool_choice)
         if 'jobs' in response:
             return {'finish_reason':'stop','message':{'role':'assistant','content':json.dumps(response)}}
@@ -240,6 +253,30 @@ def SHARED_TOOL_NAMES():
     return ["list_chats", "timeline", "search", "surrounding", "shared_windows", "finish"]
 
 # Individual test cases
+
+def test_reference_schema():
+    original = json.dumps(EXTRACT_SCHEMA, sort_keys=True)
+    first = extraction_schema({2314, 2319, 2328, 2329})
+    field = first['properties']['jobs']['items']['properties']['source_refs']
+    assert field['minItems'] == 1
+    assert field['items']['enum'] == [2314, 2319, 2328, 2329]
+    assert not {2325, 2326, 2327}.intersection(field['items']['enum'])
+    assert extraction_schema({99})['properties']['jobs']['items']['properties']['source_refs']['items']['enum'] == [99]
+    assert extraction_schema(set())['properties']['jobs']['maxItems'] == 0
+    assert json.dumps(EXTRACT_SCHEMA, sort_keys=True) == original
+    large = extraction_schema(set(range(1, 1002)) | {2000, 2002})
+    assert large['properties']['jobs']['items']['properties']['source_refs']['items']['anyOf'] == [
+        {'type': 'integer', 'minimum': 1, 'maximum': 1001},
+        {'type': 'integer', 'minimum': 2000, 'maximum': 2000},
+        {'type': 'integer', 'minimum': 2002, 'maximum': 2002},
+    ]
+    for refs in ({True}, {0}, {-1}, {'1'}):
+        try:
+            extraction_schema(refs)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError('invalid reference set accepted')
 
 def test_empty():
     api = FakeAPI()
@@ -412,6 +449,7 @@ def test_over_budget_fails():
 
 # 聚合测试入口：测试框架期望有 test() 函数
 def test():
+    test_reference_schema()
     test_empty()
     test_empty_retry_can_find_evidence()
     test_conflicting_facts_are_not_overwritten()

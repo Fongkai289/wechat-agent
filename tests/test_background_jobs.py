@@ -1,4 +1,3 @@
-import io
 import tempfile
 import threading
 import time
@@ -7,7 +6,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from wechat_agent import web
-from wechat_agent.jobs import JobRegistry, JobConflict, JobCancelled, check_job_cancelled, run_preparation
+from wechat_agent.jobs import JobRegistry, JobConflict, run_preparation
 
 
 def finished(job):

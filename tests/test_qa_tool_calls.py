@@ -8,7 +8,8 @@ from wechat_agent import web
 from wechat_agent.platform_tools import FUNCTION_FIELDS, FUNCTION_TOOLS, parse_tool_call
 from wechat_agent.platform_tools import FILTER_TOOLS
 from wechat_agent.qa_agent import run_conversation_agent
-from tests.test_qa_agent import NOW, PEOPLE, completion, decision, accept_reviews
+from wechat_agent.model_ids import ModelIDs
+from tests.test_qa_agent import NOW, PEOPLE, decision, accept_reviews
 
 
 class NativeToolTests(unittest.TestCase):
@@ -76,16 +77,42 @@ class NativeToolTests(unittest.TestCase):
             Mock(return_value={'paragraphs':[]}),Mock(),Mock(),lambda:None,now=NOW)
         selection=api.call_args_list[0]
         self.assertIsNone(selection.args[1])
-        self.assertEqual(selection.kwargs,{'tools':[t for t in FUNCTION_TOOLS if t['function']['name']!='background'],'tool_choice':'required'})
+        self.assertEqual(selection.kwargs,{'tools':ModelIDs([], []).definitions(FUNCTION_TOOLS),'tool_choice':'required'})
         messages=api.call_args_list[1].args[0]
         assistant=next(i for i,m in enumerate(messages) if m.get('tool_calls'))
         self.assertEqual(messages[assistant]['tool_calls'][0]['id'],call_id)
         self.assertEqual(messages[assistant+1]['role'],'tool')
         self.assertEqual(messages[assistant+1]['tool_call_id'],call_id)
-        self.assertEqual(json.loads(messages[assistant+1]['content'])['items'][0]['text'],'original')
+        self.assertEqual(json.loads(messages[assistant+1]['content'])['returned'],1)
+        self.assertEqual(json.loads(messages[-1]['content'])['evidence'][0]['text'],'original')
         self.assertEqual(diag['trace'][0]['tool_call_id'],call_id)
         self.assertEqual(diag['mode'],'原生工具调用检索')
         self.assertEqual(sources[0]['evidence_id'],'one')
+
+    def test_future_date_is_rejected_then_corrected_without_executing_bad_query(self):
+        bad = decision('timeline', filters={'chat_type':'all','chat_keyword':'',
+            'since':None,'until':'2026-09-30T23:59:59+08:00'})
+        api=Mock(side_effect=[bad,decision('timeline'),decision('finish')])
+        tools=Mock(); tools.state.since_ts=None
+        tools.timeline.return_value={'tool':'timeline','items':[{'evidence_id':'one','text':'original'}], 'complete':True}
+        _,sources,diag=run_conversation_agent('今天聊了什么',[],[],tools,api,
+            Mock(return_value={'paragraphs':[]}),Mock(),Mock(),lambda:None,now=NOW)
+        tools.timeline.assert_called_once()
+        feedback=next(m for m in api.call_args_list[1].args[0] if m['role']=='tool')
+        self.assertEqual(json.loads(feedback['content'])['error']['code'],'invalid_tool_arguments')
+        self.assertIn('2026-09-30T16:30:00+08:00',feedback['content'])
+        self.assertEqual(diag['trace'][0]['error']['code'],'invalid_tool_arguments')
+        self.assertEqual(len(sources),1)
+
+    def test_invalid_calls_exhaust_budget_without_running_queries(self):
+        api=Mock(side_effect=[decision('timeline',filters={'chat_type':'all','chat_keyword':'',
+            'since':None,'until':'2026-09-30T23:59:59+08:00'}) for _ in range(8)])
+        tools=Mock(); tools.state.since_ts=None
+        _,sources,diag=run_conversation_agent('今天聊了什么',[],[],tools,api,
+            Mock(),Mock(),Mock(),lambda:None,now=NOW)
+        tools.timeline.assert_not_called()
+        self.assertEqual(len(diag['trace']),8)
+        self.assertEqual(sources,[])
 
 
 if __name__ == '__main__':

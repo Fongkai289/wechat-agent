@@ -80,6 +80,15 @@ class SearchWindowTests(unittest.TestCase):
         source = self.tools.timeline(dict(self.plan, people=[]))['items']
         return next(s for s in source if s['local_id']==str(key))
 
+    def test_selected_rerank_window_is_not_sliced_to_message_target(self):
+        for key in range(1, 21):
+            self.insert(key)
+        self.hybrid.return_value = ([self.hit(key) for key in range(1, 21)],
+                                   {'rerank_unit': 'conversation_window'})
+        result = self.tools.search(dict(self.plan, people=[]), size=1)
+        self.assertEqual(result['anchor_count'], 20)
+        self.assertEqual({s['local_id'] for s in result['items']}, {str(k) for k in range(1, 21)})
+
     def test_automatic_context_respects_chat_time_and_same_second_order(self):
         self.insert(1); self.insert(2,person='bob'); self.insert(3,person='me')
         self.insert(4,hour=10); self.insert(5,chat='elsewhere'); self.insert(6,hour=15)
@@ -106,7 +115,8 @@ class SearchWindowTests(unittest.TestCase):
         self.assertEqual(diag['trace'][0]['anchor_count'],1)
         self.assertEqual(diag['trace'][0]['context_count'],2)
         request = json.loads(complete.call_args_list[1].args[0][-1]['content'])
-        self.assertTrue(any(s.get('context_ids') for s in request['evidence']))
+        self.assertTrue(request['chronological_blocks'])
+        self.assertTrue(all(isinstance(ref, int) for w in request['chronological_blocks'] for ref in w['ordered_refs']))
 
     def test_stale_index_anchor_is_rejected(self):
         self.insert(1)
@@ -131,7 +141,8 @@ class SearchWindowTests(unittest.TestCase):
             tool = json.loads(next(m['content'] for m in messages if m['role']=='tool'))
             ids = {s['evidence_id'] for s in request['source_catalog']}
             self.assertEqual(len(ids),56)
-            self.assertEqual({s['evidence_id'] for s in tool['items']}, ids)
+            self.assertEqual(tool['returned'],len(ids))
+            self.assertNotIn('items',tool)
             return decision('finish',source_ids=[s['evidence_id'] for s in hits])
         _, sources, _ = run_conversation_agent('fragment?',[],[],self.tools,choose,
             Mock(return_value={'paragraphs':[]}),Mock(),Mock(),lambda:None,now=NOW,limit=10)

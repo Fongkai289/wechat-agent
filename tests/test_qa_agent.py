@@ -1,4 +1,5 @@
 import json
+import re
 import itertools
 import sqlite3
 import tempfile
@@ -12,6 +13,7 @@ from wechat_agent.qa_agent import run_conversation_agent
 from wechat_agent.qa_tools import ConversationTools
 from wechat_agent import web
 from wechat_agent.platform_tools import FUNCTION_FIELDS
+from wechat_agent.model_ids import ID_FIELDS, model_id
 
 
 NOW = datetime(2026, 9, 30, 16, 30, tzinfo=timezone(timedelta(hours=8)))
@@ -20,6 +22,11 @@ PEOPLE = [{"id": "alice", "name": "小林", "aliases": ["小林"]}, {"id": "bob"
 
 def completion(data):
     return {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(data, ensure_ascii=False)}}]}
+
+
+def task_completion(request):
+    return completion({'request':request,'expected_result':'回答请求','clarification':'',
+                       'add_requirements':[],'remove_requirements':[]})
 
 
 CALL_IDS = itertools.count()
@@ -34,7 +41,7 @@ def accept_reviews(test):
 
 
 def action(tool, **changes):
-    return {**dict(tool=tool,query='',chat_ids=[],source_ids=[],person_ids=[],offset=0,size=20,window_seconds=1800),**changes}
+    return {**dict(tool=tool,query='',queries=[],chat_ids=[],source_ids=[],person_ids=[],offset=0,size=20,window_seconds=1800),**changes}
 
 
 def decision(tool, **changes):
@@ -42,6 +49,13 @@ def decision(tool, **changes):
     args = {k:values[k] for k in FUNCTION_FIELDS[tool]}
     if 'filters' in changes:
         args['filters'] = changes['filters']
+    # Model fixtures use the wire protocol; tool/database assertions stay raw.
+    for field, value in list(args.items()):
+        kind = ID_FIELDS.get(field)
+        if kind:
+            def handle(raw):
+                return raw if re.fullmatch(kind + r'_[0-9a-f]{24}', raw) else model_id(kind, raw)
+            args[field] = [handle(v) for v in value] if isinstance(value, list) else handle(value)
     return {'choices':[{'finish_reason':'tool_calls','message':{'content':None,'tool_calls':[
         {'id':f'call_{next(CALL_IDS)}','type':'function','function':{'name':tool,'arguments':json.dumps(args)}}]}}]}
 
@@ -104,7 +118,7 @@ class ToolTests(unittest.TestCase):
             if turn==1: return decision('statistics',filters=filters)
             if turn==2: return decision('list_chats',filters=filters)
             if turn==3:
-                self.assertEqual(calls[-1]['observations'][-1]['chats'][0]['chat_id'],'NTU@chatroom')
+                self.assertEqual(calls[-1]['observations'][-1]['chats'][0]['chat_id'],model_id('chat', 'NTU@chatroom'))
                 return decision('timeline',chat_ids=['NTU@chatroom'])
             return decision('finish')
         answer=Mock(return_value={'paragraphs':[{'kind':'answer','text':'只能确认共同发言','source_refs':[1]}]})
@@ -115,6 +129,8 @@ class ToolTests(unittest.TestCase):
 
     def test_empty_search_can_be_followed_by_timeline(self):
         self.insert(1)
+        self.hybrid.return_value = ([], {'timings':{'rerank_ms':123},
+            'rerank_batch_timings':[{'batch':1,'elapsed_ms':120,'candidates':8,'attempts':1}]})
         answer=Mock(return_value={'paragraphs':[]})
         complete=Mock(side_effect=[decision('search',query='no match'),
                                    decision('timeline'),decision('finish')])
@@ -122,6 +138,65 @@ class ToolTests(unittest.TestCase):
                                               Mock(),Mock(),lambda:None,now=NOW)
         self.assertTrue(sources)
         self.assertEqual([t['tool'] for t in diag['trace']],['search','timeline'])
+        self.assertEqual(diag['trace'][0]['timings']['rerank_ms'],123)
+        self.assertEqual(diag['trace'][0]['rerank_batch_timings'][0]['candidates'],8)
+        self.assertTrue(all(m['request_chars'] > 0 for m in diag['model_metrics']))
+        self.assertEqual(len(diag['answer_timings']),1)
+
+    def test_live_diagnostics_publish_active_phase_and_bounded_result_previews(self):
+        for i in range(7):
+            self.insert(i)
+        self.conn.execute("UPDATE messages SET text=?", ('x' * 1200,))
+        self.conn.commit()
+        events, checkpoints = [], []
+
+        def emit(event, **data):
+            events.append(json.loads(json.dumps(data)))
+
+        def checkpoint(data, sources):
+            checkpoints.append(json.loads(json.dumps(data)))
+
+        def choose(messages, schema, **options):
+            self.assertEqual(events[-1]['retrieval']['active_step']['phase'], 'model')
+            request = json.loads(messages[-1]['content'])
+            for step in request['trace']:
+                self.assertNotIn('preview', step)
+                self.assertNotIn('preview_total', step)
+            return decision('finish') if events[-1]['retrieval']['trace'] else decision('timeline')
+
+        original = self.tools.timeline
+
+        def read(*args, **kwargs):
+            active = events[-1]['retrieval']['active_step']
+            self.assertEqual(active['phase'], 'tool')
+            self.assertEqual(active['parameters']['tool'], 'timeline')
+            self.assertGreater(active['started_at_ms'], 0)
+            return original(*args, **kwargs)
+
+        with patch.object(self.tools, 'timeline', side_effect=read):
+            _, _, diag = run_conversation_agent('查看消息', [], PEOPLE, self.tools, choose,
+                Mock(return_value={'paragraphs': []}), emit, checkpoint, lambda: None, now=NOW)
+        self.assertIsNone(diag['active_step'])
+        step = diag['trace'][0]
+        self.assertEqual(step['preview_total'], 7)
+        self.assertEqual(len(step['preview']), 5)
+        self.assertEqual(len(step['preview'][0]['text']), 800)
+        self.assertNotIn('source_db', step['preview'][0])
+        self.assertEqual(checkpoints[-1], events[-1]['retrieval'])
+        self.assertTrue(any(e['retrieval']['trace'] and
+                            e['retrieval']['active_step']['phase'] == 'model' for e in events))
+
+    def test_failed_tool_keeps_active_parameters_in_last_checkpoint(self):
+        snapshots = []
+        with patch.object(self.tools, 'timeline', side_effect=TimeoutError('test timeout')):
+            with self.assertRaises(TimeoutError):
+                run_conversation_agent('查看消息', [], PEOPLE, self.tools,
+                    Mock(return_value=decision('timeline')), Mock(), Mock(),
+                    lambda data, sources: snapshots.append(json.loads(json.dumps(data))),
+                    lambda: None, now=NOW)
+        self.assertEqual(snapshots[-1]['active_step']['phase'], 'tool')
+        self.assertEqual(snapshots[-1]['active_step']['parameters']['tool'], 'timeline')
+        self.assertEqual(snapshots[-1]['trace'], [])
 
     def test_invented_chat_id_rejected_before_tool_execution(self):
         from wechat_agent.platform_tools import validate_action
@@ -152,11 +227,12 @@ class ToolTests(unittest.TestCase):
 
     def test_repeated_call_stops_without_infinite_retrieval(self):
         self.insert(1)
-        complete=Mock(side_effect=[decision('timeline'),decision('timeline')])
+        complete=Mock(side_effect=[decision('timeline'),decision('timeline'),decision('finish')])
         answer=Mock(return_value={'paragraphs':[]})
         _,_,diag=run_conversation_agent('小林今天下午说什么',[],PEOPLE,self.tools,complete,answer,
                                       Mock(),Mock(),lambda:None,now=NOW)
-        self.assertEqual(len(diag['trace']),1)
+        self.assertEqual(len(diag['trace']),2)
+        self.assertEqual(diag['trace'][-1]['error']['code'],'duplicate_query')
         self.assertFalse(diag['coverage']['exhaustive'])
 
     def test_context_preserves_other_senders_without_relabeling(self):
@@ -237,7 +313,7 @@ class ToolTests(unittest.TestCase):
     def test_graph_saves_plan_trace_and_only_current_evidence(self):
         self.insert(1); self.insert(2, person="bob"); self.insert(3, days=400)
         seed=self.tools.timeline(self.plan)['items'][0]['evidence_id']
-        complete = Mock(side_effect=[decision('timeline',filters={'chat_type':'all','chat_keyword':'',
+        complete = Mock(side_effect=[task_completion('结合之前关于小林的问题，分析她今天下午的态度'),decision('timeline',filters={'chat_type':'all','chat_keyword':'',
             'since':NOW.replace(hour=12,minute=0).isoformat(),'until':None}),
             decision('surrounding',source_ids=[seed]),decision('finish')])
         answer = Mock(return_value={"paragraphs": [{"kind": "answer", "text": "在讨论实习", "source_refs": [1]}]})
@@ -254,7 +330,7 @@ class ToolTests(unittest.TestCase):
     def test_graph_no_evidence_never_calls_answer_or_hybrid(self):
         answer = Mock()
         result, sources, diag = run_conversation_agent("她今天下午什么态度", [{"role": "user", "content": "小林想找实习吗"}],
-            PEOPLE, self.tools, Mock(side_effect=[decision('timeline',filters={'chat_type':'all','chat_keyword':'',
+            PEOPLE, self.tools, Mock(side_effect=[task_completion('分析小林今天下午的态度'),decision('timeline',filters={'chat_type':'all','chat_keyword':'',
                 'since':NOW.replace(hour=12,minute=0).isoformat(),'until':None}),decision('finish')]), answer, Mock(), Mock(), lambda: None, now=NOW)
         self.assertFalse(sources); answer.assert_not_called(); self.hybrid.assert_not_called()
         self.assertEqual(result["paragraphs"][0]["kind"], "limitation")

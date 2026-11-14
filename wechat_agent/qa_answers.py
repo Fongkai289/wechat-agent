@@ -1,8 +1,9 @@
 """Structured Q&A answers reference a frozen, server-owned source list."""
 from __future__ import annotations
 
-import json
+from copy import deepcopy
 from typing import Any
+from .model_output import strict_json
 
 
 # 回答只输出段落及数字引用，来源详情由服务端冻结的证据列表提供。
@@ -33,6 +34,33 @@ QA_ANSWER_FORMAT = {
         },
     },
 }
+
+
+def qa_answer_format(source_count: int) -> dict[str, Any]:
+    """Constrain citations to the final context, not the retrieval working set."""
+    if type(source_count) is not int or source_count < 0:
+        raise ValueError("source_count must be a nonnegative integer")
+    result = deepcopy(QA_ANSWER_FORMAT)
+    paragraphs = result['json_schema']['schema']['properties']['paragraphs']
+    paragraphs['minItems'] = 1
+    template = paragraphs['items']
+    branches = []
+    for kind in ('answer', 'limitation') if source_count else ('limitation',):
+        branch = deepcopy(template)
+        properties = branch['properties']
+        properties['kind']['enum'] = [kind]
+        refs = properties['source_refs']
+        if source_count:
+            # Final sources are numbered contiguously from 1. Integer bounds
+            # express the exact set without an enum-size limit on large contexts.
+            refs['items'] = {'type': 'integer', 'minimum': 1, 'maximum': source_count}
+            if kind == 'answer':
+                refs['minItems'] = 1
+        else:
+            refs['maxItems'] = 0
+        branches.append(branch)
+    paragraphs['items'] = {'anyOf': branches} if len(branches) > 1 else branches[0]
+    return result
 
 
 def validate_qa_answer(data: Any, source_count: int) -> dict[str, Any]:
@@ -73,7 +101,7 @@ def parse_qa_answer(payload: dict[str, Any], source_count: int) -> dict[str, Any
     content = message.get("content")
     if not isinstance(content, str) or not content.strip():
         raise ValueError("Missing structured answer")
-    return validate_qa_answer(json.loads(content), source_count)
+    return validate_qa_answer(strict_json(content), source_count)
 
 
 def qa_answer_text(data: dict[str, Any]) -> str:

@@ -2,13 +2,21 @@
 import json
 from datetime import datetime
 
-from .model_output import STRING, object_schema
+from .model_output import STRING, object_schema, strict_json
 from .platform_data_tools import DATA_TOOLS, validate_data_arguments
+
+
+class ToolArgumentError(ValueError):
+    """A well-formed call with rejected arguments; safe to return to the model."""
+    def __init__(self, message, assistant):
+        super().__init__(message)
+        self.assistant = assistant
 
 
 # One native tool contract is shared by Q&A and editable code Skills.
 ARGUMENT_SCHEMAS = {
     'query': STRING,
+    'queries': {'type':'array','items':{'type':'string','minLength':1,'maxLength':500},'maxItems':6},
     'chat_ids': {'type':'array','items':STRING},
     'person_ids': {'type':'array','items':STRING},
     'source_ids': {'type':'array','items':STRING},
@@ -20,7 +28,7 @@ FUNCTION_FIELDS = {
     'list_chats': ('chat_ids','person_ids','offset','size'),
     'shared_windows': ('chat_ids','person_ids','offset','size','window_seconds'),
     'timeline': ('chat_ids','person_ids','offset','size'),
-    'search': ('chat_ids','person_ids','query','size'),
+    'search': ('chat_ids','person_ids','query','queries','size'),
     'surrounding': ('source_ids','size'),
     'statistics': ('chat_ids','person_ids'),
     'unanswered': ('chat_ids','person_ids','size'),
@@ -30,7 +38,7 @@ FUNCTION_DESCRIPTIONS = {
     'list_chats': '查找会话，可按会话名称和类型筛选，返回群名、会话ID、发送者发言数及分页信息；不证明互动。',
     'shared_windows': '定位同一群内指定人物的共同发言候选时间窗，至少两人；返回双方原文和周边消息，候选数不是互动次数。',
     'timeline': '按本次提供的人物、时间和会话条件读取原始消息，按时间倒序分页。',
-    'search': '用query做关键词与语义混合检索，可直接搜索；size限制命中数，另附同会话30分钟内前后各3条起、补齐边界同人连续发言（最多各12条）的原文和context_ids关联。相邻不代表同一话题；不代表穷尽所有消息。',
+    'search': '搜索消息正文。query是本次检索目标；queries可提供多个不同角度的正文查询，空数组表示只用query。各查询独立召回、合并去重后针对query统一重排；不要把多个检索角度拼成一串词。可直接搜索；候选按会话窗口重排，size为消息目标数，完整展开末个窗口可能超过目标。另附同会话30分钟内前后各3条起、补齐边界同人连续发言（最多各12条）的原文和context_ids关联。相邻不代表同一话题；不代表穷尽所有消息。',
     'surrounding': '根据已取得的证据ID展开前后文，保留其他发送者的真实身份。',
     'statistics': '用本地索引统计范围内消息数，不是两人相互回复次数。',
     'unanswered': '查找指定时间窗内最后消息来自对方的私聊候选；不代表必须回复。',
@@ -40,7 +48,8 @@ FIELD_DESCRIPTIONS = {
     'chat_ids': '仅可使用工具已返回的会话ID；空数组不增加会话限制。',
     'person_ids': '仅可使用平台已返回的真实人物ID；空数组不增加人物限制。',
     'source_ids': '仅可使用实际取得的evidence_id；展开上下文时不能为空。',
-    'query': '本次搜索文本，可按对话上下文改写或更换关键词。',
+    'query': '本次要检索的问题或文本；search用它统一评估候选相关性，不限制会话名称。',
+    'queries': '不同角度的消息正文查询，每项为一个有意义的查询句或词组；模型按问题自主生成，无需固定数量。空数组只检索query。',
     'offset': '从0开始；后续分页使用工具返回的next_offset。',
     'size': '本页证据数量预算，1至60；共同时间窗至少为2。',
     'window_seconds': '共同发言候选的最大间隔，1至3600秒；不是直接互动的判定标准。',
@@ -49,7 +58,10 @@ FUNCTION_FIELDS['find_people'] = ('query','offset','size')
 FUNCTION_DESCRIPTIONS['find_people'] = '按姓名或账号查找真实人物，返回候选身份，不自动选择同名人物或限制后续搜索。'
 FILTER_SCHEMA = {'anyOf': [{'type':'null'}, object_schema({
     'chat_type': {'type':'string','enum':['all','group','private']},
-    'chat_keyword': STRING,
+    'chat_title_contains': {'type':'string','maxLength':100,'description':'仅筛选联系人或群聊显示名称：名称必须包含此字段的整段文字。不是消息内容关键词，不分词；用户未指定名称范围时填空字符串。正文检索用query/queries。'},
+    'exclude_person_ids': {'type':'array','items':STRING,'maxItems':60,
+        'description':'用户明确要求排除的已确认人物ID；排除该人物私聊及其群内发言。无排除条件传空数组。'},
+    'diversify_by_chat': {'type':'boolean','description':'需要跨会话比较时设true：优先返回不同会话的高分窗口，再补同会话窗口；不改变相关性评分。'},
     'since': {'type':['string','null'], 'description':'消息发送时间下界，带时区的ISO日期时间；不限制时为null。'},
     'until': {'type':['string','null'], 'description':'消息发送时间上界，带时区的ISO日期时间；不限制时为null。'},
 })], 'description':'仅用于本次调用的可选过滤，不继承上次搜索条件。正文讨论的日期可直接放入query。null表示不加过滤；任务固定时间窗仍有效。'}
@@ -104,23 +116,46 @@ def action_from_arguments(name, values, sources, observations, plan):
         return validate_data_arguments(name, values, sources, observations, plan)
     values = dict(values)
     filters = values.pop('filters', None) if name in FILTER_TOOLS else None
+    if name=='search': values.setdefault('queries',[])  # Existing saved Skill calls remain valid.
     if set(values)!=set(FUNCTION_FIELDS[name]):
         raise ValueError('工具参数与声明不一致，未执行工具')
-    defaults = dict(tool=name,query='',chat_ids=[],person_ids=[],source_ids=[],offset=0,size=20,window_seconds=1800)
+    defaults = dict(tool=name,query='',queries=[],chat_ids=[],person_ids=[],source_ids=[],offset=0,size=20,window_seconds=1800)
     action = validate_action({**defaults,**values},sources,observations,plan)
     validate_filters(filters, plan)
-    action['filters'] = filters
+    if filters and filters.get('exclude_person_ids'):
+        validate_action({**defaults, 'person_ids':filters['exclude_person_ids']},sources,observations,plan)
+    action['filters'] = normalize_filters(filters)
     return action
 
 
+def normalize_filters(value):
+    # Accept old saved Skills at the boundary, but expose only the unambiguous
+    # name to the model. Never interpret a title filter as body search.
+    if value is None: return None
+    if not isinstance(value,dict): raise ValueError('查询过滤参数无效')
+    value = dict(value)
+    if 'chat_keyword' in value:
+        if 'chat_title_contains' in value: raise ValueError('会话名称筛选字段重复')
+        value['chat_title_contains'] = value.pop('chat_keyword')
+    return value
+
+
 def validate_filters(value, boundary):
+    value = normalize_filters(value)
     if value is None:
         return {}
-    if not isinstance(value,dict) or set(value)!={'chat_type','chat_keyword','since','until'}:
+    if set(value)-{'exclude_person_ids','diversify_by_chat'}!={'chat_type','chat_title_contains','since','until'}:
         raise ValueError('查询过滤参数无效')
-    if value['chat_type'] not in ('all','group','private') or not isinstance(value['chat_keyword'],str) or len(value['chat_keyword'])>100:
+    excluded = value.get('exclude_person_ids',[])
+    if not isinstance(excluded,list) or len(excluded)>60 or any(not isinstance(v,str) or not v for v in excluded):
+        raise ValueError('排除人物参数无效')
+    if value['chat_type'] not in ('all','group','private') or not isinstance(value['chat_title_contains'],str) or len(value['chat_title_contains'])>100:
         raise ValueError('会话过滤参数无效')
-    result = {'chat_scope':{'type':value['chat_type'],'keyword':value['chat_keyword']}}
+    result = {'chat_scope':{'type':value['chat_type'],'keyword':value['chat_title_contains']}}
+    result['exclude_person_ids'] = list(dict.fromkeys([*(boundary.get('exclude_person_ids') or []),*excluded]))
+    if type(value.get('diversify_by_chat',False)) is not bool:
+        raise ValueError('会话多样性参数必须为布尔值')
+    result['diversify_by_chat'] = value.get('diversify_by_chat',False)
     for key in ('since','until'):
         if value[key] is None:
             continue
@@ -172,27 +207,32 @@ def parse_tool_call(payload, sources, observations, plan, previous_messages):
     if not isinstance(name,str) or name not in FUNCTION_FIELDS or not isinstance(arguments,str) or len(arguments)>32000:
         raise ValueError('未知工具或无效的工具参数')
     try:
-        values = json.loads(arguments)
+        values = strict_json(arguments)
     except json.JSONDecodeError as exc:
         raise ValueError('工具参数不是有效JSON，未执行工具') from exc
     # 两个入口复用参数和范围校验，不让代码 Skill 绕过边界。
-    action = action_from_arguments(name,values,sources,observations,plan)
     canonical = {'id':call_id,'type':'function','function':{'name':name,'arguments':arguments}}
-    return action, {'role':'assistant','content':None,'tool_calls':[canonical]}
+    assistant = {'role':'assistant','content':None,'tool_calls':[canonical]}
+    try:
+        action = action_from_arguments(name,values,sources,observations,plan)
+    except ValueError as exc:
+        raise ToolArgumentError(str(exc), assistant) from exc
+    return action, assistant
 
 
 def tool_result_message(call_id, result):
-    # 回执携带分页元信息与有界原文预览，完整证据仍由服务端工作集管理。
-    observation = {k:result[k] for k in ('tool','matched','next_offset','complete','note','chats','people','windows','window_seconds','anchor_count','context_count') if k in result}
+    # Keep bounded historical excerpts locally; the decision view deduplicates
+    # them against its current previews instead of replaying evidence graphs.
+    observation = {k:result[k] for k in ('tool','matched','next_offset','complete','note','error','scope_diagnostics','chats','people','windows','window_seconds','anchor_count','context_count') if k in result}
     items, budget = [], 1500
     for source in result.get('items',[]):
-        item = {k:source.get(k) for k in ('evidence_id','chat_id','chat_title','chat_type','sender','time','evidence_role','context_ids','context_for')}
-        text = str(source.get('text',''))
+        text = str(source.get('text') or '')
         excerpt = text[:min(500,budget)]
         budget -= len(excerpt)
-        item.update(text=excerpt,preview_truncated=len(excerpt)<len(text))
-        items.append(item)
-    observation.update(items=items,evidence_view='完整工作集的有界预览在后续平台状态消息中；截断不代表完整覆盖。')
+        items.append({'evidence_id':source.get('evidence_id'), 'text':excerpt,
+                      'preview_truncated':len(excerpt)<len(text)})
+    observation.update(items=items,returned=len(result.get('items',[])),
+                       evidence_view='消息目录及有界原文预览在本轮平台状态消息中；截断不代表完整覆盖。')
     return {'role':'tool','tool_call_id':call_id,'content':json.dumps(observation,ensure_ascii=False)}
 
 INSTRUCTIONS = (
@@ -206,11 +246,15 @@ INSTRUCTIONS = (
 
 def validate_action(value, sources, observations, plan=None):
     value=dict(value)
+    value.setdefault('queries',[])
     fields = {'tool', *ARGUMENT_SCHEMAS}
     if set(value)!=fields or value['tool'] not in TOOLS:
         raise ValueError('检索工具调用格式无效')
     if not isinstance(value['query'],str) or len(value['query'])>500:
         raise ValueError('检索词无效')
+    if not isinstance(value['queries'],list) or len(value['queries'])>6 or any(not isinstance(q,str) or not q.strip() or len(q)>500 for q in value['queries']):
+        raise ValueError('queries必须是最多6条非空的消息内容查询')
+    value['queries'] = list(dict.fromkeys(q.strip() for q in value['queries']))
     for field in ('chat_ids','source_ids','person_ids'):
         if not isinstance(value[field],list) or len(value[field])>60 or any(not isinstance(x,str) for x in value[field]):
             raise ValueError('检索来源参数无效')
@@ -258,7 +302,9 @@ def execute_action(tools, plan, action, sources):
     if name=='list_chats': return tools.list_chats(plan,offset,size)
     if name=='shared_windows': return tools.shared_windows(plan,offset,size,action['window_seconds'])
     if name=='timeline': return tools.timeline(plan,offset,size)
-    if name=='search': return tools.search(plan,action['query'] or plan['query'],size)
+    if name=='search':
+        plan['queries'] = [{'text':q} for q in action.get('queries',[])]
+        return tools.search(plan,action['query'] or plan['query'],size)
     if name=='statistics': return tools.statistics(plan)
     if name=='unanswered': return tools.unanswered(plan,size)
     if name=='surrounding':

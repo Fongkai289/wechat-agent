@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 from types import SimpleNamespace
 
 from .platform_api import PlatformAPI, COLUMNS
 from .skill_retrieval import SkillRetrieval
+from .retrieval_execution import retrieval_progress
+from .model_output import output_contract, structured_format, parse_structured_completion
+from .platform_sql import SQLScopeError
 
 QA_LIMITS = {'permissions':['messages.read','index.query','embedding','llm'],
              'max_llm_calls':256, 'max_embedding_calls':32}
@@ -51,7 +55,7 @@ def prepare_platform_indexes(state, semantic, progress, add_usage):
 
 class PlatformModel:
     """Keep provider configuration and credentials in the host, not the caller."""
-    def __init__(self, profile, config, check, timeout=90):
+    def __init__(self, profile, config, check, timeout=180):
         self.profile, self.config, self.check, self.timeout = profile, config, check, timeout
 
     def complete(self, messages, response_format=None, **options):
@@ -61,12 +65,13 @@ class PlatformModel:
         if not key:
             raise ValueError('请先配置模型 API Key')
         payload = app.call_chat_payload(self.profile, key, messages, timeout=self.timeout,
-                                       response_format=response_format, **options)
+                                       response_format=response_format, stream=True, **options)
         self.check()
         return payload
 
     def llm(self, messages, schema=None, **options):
-        response_format = {'type':'json_schema','json_schema':{'name':'platform_result','strict':True,'schema':schema}} if schema else None
+        response_format = output_contract(structured_format('platform_result',schema) if schema is not None else None,
+                                          options.get('tools'), options.get('tool_choice','auto'))
         payload = self.complete(messages, response_format, **options)
         choice = (payload.get('choices') or [{}])[0]
         if (choice.get('message') or {}).get('refusal'):
@@ -74,13 +79,17 @@ class PlatformModel:
         if options.get('tools') is not None:
             if choice.get('finish_reason') not in ('tool_calls','stop'):
                 raise ValueError('模型工具调用被截断或未完成')
-            return {'finish_reason':choice['finish_reason'],'message':choice.get('message') or {}}, payload.get('usage') or {}
-        if choice.get('finish_reason') not in ('stop', None):
-            raise ValueError('模型输出未完成，未保存成功结果')
-        content = (choice.get('message') or {}).get('content')
-        if not isinstance(content, str) or not content.strip():
-            raise ValueError('模型未返回内容')
-        return json.loads(content) if schema else content, payload.get('usage') or {}
+            if choice['finish_reason']=='stop':
+                if response_format is None:
+                    raise ValueError('要求工具调用时不能返回文本答案')
+                value = parse_structured_completion(payload, response_format)
+                message = dict(choice['message'])
+                message['content'] = json.dumps(value,ensure_ascii=False) if schema is not None else value['text']
+            else:
+                message = choice.get('message') or {}
+            return {'finish_reason':choice['finish_reason'],'message':message}, payload.get('usage') or {}
+        value = parse_structured_completion(payload, response_format)
+        return value if schema is not None else value['text'], payload.get('usage') or {}
 
 
 def create_platform_runtime(state, context, limits, config, profile_name, check, maintenance_lock,
@@ -147,7 +156,7 @@ def create_platform_runtime(state, context, limits, config, profile_name, check,
                 for row in conn.execute('SELECT '+','.join(COLUMNS)+' FROM messages WHERE timestamp>=? AND timestamp<=? ORDER BY timestamp,id',(start,end)):
                     check()
                     rows.append(dict(row))
-                    if len(rows)>300000: raise ValueError('索引时间范围超过安全预算，请缩小范围；未截断')
+                    if len(rows)>300000: raise SQLScopeError('索引时间范围超过 300000 条安全预算；未执行查询、未截断消息')
                 return rows
             finally: conn.close()
         return locked(read)
@@ -181,23 +190,26 @@ def create_platform_runtime(state, context, limits, config, profile_name, check,
         from .platform_tools import execute_action
         def hybrid(query,people,start,end,count,scope=None):
             calls = 0
+            call_lock = threading.Lock()
             def rerank_call(profile, key, messages, **options):
                 nonlocal calls
                 # api.tool reserves the first rerank call; charge every extra batch/repair.
-                if calls:
-                    api.model_calls += 1
-                    if api.model_calls > api.limits['max_llm_calls']:
-                        raise ValueError('共享检索的重排调用预算已用完')
-                calls += 1
+                check()
+                with call_lock:
+                    if calls:
+                        if api.model_calls >= api.limits['max_llm_calls']:
+                            raise ValueError('共享检索的重排调用预算已用完')
+                        api.model_calls += 1
+                    calls += 1
                 payload = app.call_chat_payload(profile, key, messages, **options)
-                api.add_usage(payload.get('usage') or {}, 'shared_search_rerank')
-                choice = (payload.get('choices') or [{}])[0]
-                if choice.get('finish_reason') != 'stop':
-                    raise RuntimeError('重排输出未完成')
-                return (choice.get('message') or {}).get('content') or ''
-            result,diagnostics=app.search_qa_search_db(state,query,people,start,count,
-                {**(scope or {}),'verified_people':True,'time_until':end,'queries':[{'text':query}]},
-                rerank_call=rerank_call)
+                with call_lock:
+                    api.add_usage(payload.get('usage') or {}, 'shared_search_rerank')
+                value = parse_structured_completion(payload, options.get('response_format') or output_contract())
+                return json.dumps(value, ensure_ascii=False)
+            with retrieval_progress(api.report):
+                result,diagnostics=app.search_qa_search_db(state,query,people,start,count,
+                    {**(scope or {}),'verified_people':True,'time_until':end,'queries':(scope or {}).get('queries') or [{'text':query}]},
+                    rerank_call=rerank_call)
             semantic=diagnostics.get('semantic') or {}
             api.add_usage(semantic.get('usage') or {},'shared_search_embedding')
             if semantic.get('error') or diagnostics.get('rerank_error'):
@@ -215,7 +227,10 @@ def create_platform_runtime(state, context, limits, config, profile_name, check,
             return execute_action(ConversationTools(state,hybrid,app.qa_item_from_search_row,check),plan,action,sources)
         return locked(run)
 
-    model = PlatformModel(profile, config, check, app.GOAL_MODEL_TIMEOUT_SECONDS if profile_name == 'task' else 90)
+    # Q&A must use the shared default; an explicit legacy timeout here would
+    # override it for decisions, answer generation and review alike.
+    model_options = {'timeout': app.GOAL_MODEL_TIMEOUT_SECONDS} if profile_name == 'task' else {}
+    model = PlatformModel(profile, config, check, **model_options)
     api = PlatformAPI(limits, context, chats, messages, indexed, semantic, surrounding, model.llm,
                       state=local_state, report=report, tools=shared_tool)
     api.backends['indexed_window'] = indexed

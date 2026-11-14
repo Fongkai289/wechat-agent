@@ -9,6 +9,10 @@ import time
 from .skill_retrieval import message_key
 
 
+class SQLScopeError(ValueError):
+    """A local query needs replanning; no provider request failed."""
+
+
 class SQLSnapshot:
     def __init__(self):
         self.lock = threading.RLock()
@@ -29,7 +33,7 @@ class SQLSnapshot:
         self.close()
         rows = reader()
         if len(rows) > 300000:
-            raise ValueError('SQL 时间范围超过 300000 条安全预算，请缩小范围；未截断')
+            raise SQLScopeError('SQL 时间范围超过 300000 条安全预算；未执行查询、未截断消息')
         if any(not bounds[0] <= row['timestamp'] <= bounds[1] for row in rows):
             raise ValueError('索引快照越界')
         # Graph workers may change threads; the owner serializes every query/close.

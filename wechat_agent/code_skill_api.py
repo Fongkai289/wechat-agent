@@ -1,5 +1,5 @@
 """Skill adapter: package permissions feed the shared platform API."""
-from .platform_api import PlatformAPI, COLUMNS
+from .platform_api import PlatformAPI, COLUMNS  # noqa: F401  (COLUMNS is re-exported)
 from .code_skill_packages import manifest
 
 

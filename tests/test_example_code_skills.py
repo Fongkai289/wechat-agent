@@ -1,7 +1,8 @@
 """Portable task examples stay independent of the platform's business logic."""
-import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -25,6 +26,12 @@ class ExamplePackageTests(unittest.TestCase):
     def test_packages_are_valid(self):
         for name in ('unanswered', 'internships'):
             self.assertEqual(example_package(name)['schema_version'], 3)
+
+    def test_internship_reference_constraints_without_sandbox(self):
+        root = Path(__file__).resolve().parents[1] / 'examples' / 'skills' / 'internships'
+        result = subprocess.run([sys.executable, str(root / 'test_skill.py')],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 @unittest.skipUnless(os.environ.get('TEST_CODE_SKILL_SANDBOX') == '1', 'Explicit sandbox integration test')

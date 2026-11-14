@@ -128,7 +128,7 @@ def transcribe_voice_data(
 
 def transcribe_wav(wav_data: bytes) -> dict[str, str]:
     try:
-        import whisper
+        import whisper  # noqa: F401  (availability check before transcribing)
     except Exception as exc:
         raise RuntimeError("缺少 openai-whisper：请先运行 .venv/bin/python -m pip install openai-whisper") from exc
 

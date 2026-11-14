@@ -12,6 +12,7 @@ from wechat_agent.code_skill_service import synthetic_api, generate_code_skill, 
 from wechat_agent.capabilities import assess_capabilities, capability_catalog
 from wechat_agent.goals import GoalStore
 from wechat_agent.platform_tools import FUNCTION_TOOLS
+from wechat_agent.model_ids import ModelIDs
 
 
 def report(status='supported',capabilities=None):
@@ -53,7 +54,8 @@ class SharedToolsTests(unittest.TestCase):
         last=self.api.dispatch('llm',{'messages':messages,'tools':['list_chats']})
         self.assertEqual(last['message']['content'],'Finished')
         self.assertEqual(self.api.usage['total_tokens'],9)
-        self.assertEqual(self.api.backends['llm'].call_args.kwargs['tools'],self.api.api_tools(['list_chats']))
+        self.assertEqual(self.api.backends['llm'].call_args.kwargs['tools'],
+                         ModelIDs(self.api.available_sources(), self.api.tool_observations).definitions(self.api.api_tools(['list_chats'])))
 
     def test_unknown_tools_permissions_and_history_rejected_before_api(self):
         self.api.backends['llm']=Mock()

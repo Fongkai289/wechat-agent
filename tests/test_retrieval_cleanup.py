@@ -45,8 +45,8 @@ class NeutralRetrievalTests(unittest.TestCase):
         def complete(profile, key, messages, **kwargs):
             candidates = json.loads(messages[1]["content"])["candidates"]
             seen.extend(c["text"] for c in candidates)
-            return json.dumps({"results": [
-                {"id": c["id"], "score": 1 if c["text"] == "correct" else 0.1} for c in candidates]})
+            return json.dumps({"scores": {
+                c["id"]: {"score": 1 if c["text"] == "correct" else 0.1,"reason":"fixture"} for c in candidates}})
         config = {"qa": {}, "rerank": {"enabled": True, "batch_size": 8}}
         with patch.object(web, "load_llm_config", return_value=config), patch.object(
                 web, "effective_llm_profile", return_value={}), patch.object(
@@ -64,12 +64,12 @@ class NeutralRetrievalTests(unittest.TestCase):
         for rows in ([], [{"id":"c1","score":0.8}], [{"id":"alien","score":1}],
                      [{"id":"c1","score":float("nan")}, {"id":"c2","score":0}],
                      [{"id":"c1","score":1}, {"id":"c1","score":0}]):
-            with self.subTest(rows=rows), self.assertRaises(RuntimeError):
+            with self.subTest(rows=rows), self.assertRaises(ValueError):
                 web.apply_rerank_response(json.dumps({"results":rows}), items, items, 1)
 
     def test_batch_failure_falls_back_as_a_whole_not_mixed_scores(self):
         items = [{"local_id":str(i)} for i in range(9)]
-        response = json.dumps({"results":[{"id":f"c{i+1}","score":0.5} for i in range(8)]})
+        response = json.dumps({"scores":{f"c{i+1}":{"score":0.5,"reason":"fixture"} for i in range(8)}})
         with patch.object(web, "load_llm_config", return_value={"qa":{}, "rerank":{"enabled":True,"batch_size":8}}), \
              patch.object(web, "effective_llm_profile", return_value={}), \
              patch.object(web, "resolve_llm_api_key", return_value="synthetic"), \
@@ -96,10 +96,11 @@ class NeutralRetrievalTests(unittest.TestCase):
                  "semantic_chunk_id":7, "text":"same-chat context", "semantic_score":0.8}], {})), \
              patch.object(web, "rerank_qa_items_with_config", side_effect=rerank):
             web.search_qa_search_db(self.state, "internship", [], None, 10, {"queries":[{"text":"internship"}]})
-        self.assertEqual(len(seen), 2)
-        self.assertEqual({str(x["local_id"]) for x in seen}, {"1","2"})
-        self.assertTrue(all("embedding" in x["retrieval_sources"] and "fts" in x["retrieval_sources"] for x in seen))
-        self.assertTrue(all(x["retrieval_context"] == "same-chat context" for x in seen))
+        self.assertEqual(len(seen), 1)
+        members=seen[0]['retrieval_members']
+        self.assertEqual({str(x['local_id']) for x in members},{'1','2'})
+        self.assertTrue(all('embedding' in x['retrieval_sources'] and 'fts' in x['retrieval_sources'] for x in members))
+        self.assertEqual(seen[0]['rerank_unit'],'conversation_window')
 
     def migration_fixture(self):
         self.insert(1)

@@ -45,6 +45,9 @@ class AnswerReviewTests(unittest.TestCase):
             return self.choose(messages,schema,**options)
         result = self.review(messages,schema)
         data = json.loads(result['choices'][0]['message']['content'])
+        if 'task_checks' in schema['json_schema']['schema']['properties']:
+            data['task_checks']={key:{'status':'satisfied','reason':'Task checked'} for key in
+                schema['json_schema']['schema']['properties']['task_checks']['properties']}
         count = len(json.loads(messages[-1]['content'])['draft']['paragraphs'])
         data['checks'].extend({'paragraph_index':i,'status':'supported','reason':'Server coverage notice','source_refs':[]}
                               for i in range(2,count+1))
@@ -90,14 +93,24 @@ class AnswerReviewTests(unittest.TestCase):
         self.assertEqual(self.answer.call_count,2)
 
     def test_failed_repairs_are_bounded_and_do_not_publish_rejected_draft(self):
+        self.choose.side_effect=[decision('timeline'),decision('finish'),decision('finish')]
         self.review.return_value = verdict('revise')
         self.answer.return_value = draft('Known contradictory conclusion')
         result,sources,diag = self.run_agent()
-        self.assertEqual(self.review.call_count,3)
-        self.assertEqual(self.answer.call_count,3)
+        self.assertEqual(self.review.call_count,1)
+        self.assertTrue(diag["answer_reviews"][-1]["reused"])
+        self.assertEqual(self.answer.call_count,2)
         self.assertEqual(diag['quality_status'],'unresolved')
         self.assertNotIn('Known contradictory',str(result))
         self.assertEqual(result['paragraphs'][0]['kind'],'limitation')
+
+    def test_changed_but_still_rejected_answer_has_only_one_correction(self):
+        self.answer.side_effect=[draft('first unsupported'),draft('different unsupported')]
+        self.review.side_effect=[verdict('revise'),verdict('revise')]
+        _,_,diag=self.run_agent()
+        self.assertEqual(self.review.call_count,2)
+        self.assertEqual(self.answer.call_count,2)
+        self.assertEqual(diag['quality_status'],'unresolved')
 
     def test_budget_exhaustion_does_not_restart_search_indefinitely(self):
         self.choose.side_effect = [decision('timeline',offset=i) for i in range(8)]

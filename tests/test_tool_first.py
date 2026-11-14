@@ -1,7 +1,7 @@
 """No mandatory planner; independent tool queries under platform boundaries."""
 import json
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 from tests import test_qa_agent as fixtures
 from tests.test_code_skills import package
@@ -23,22 +23,23 @@ class ToolFirstTests(unittest.TestCase):
         return run_conversation_agent(question, history or [], PEOPLE, self.tools, complete,
                 Mock(return_value={'paragraphs':[]}), Mock(), Mock(), lambda:None, now=NOW)
 
-    def test_first_call_is_native_search_with_history_not_slot_schema(self):
+    def test_followup_resolves_task_then_uses_native_tools_without_slot_routing(self):
         self.insert(1, days=400)
         self.hybrid.return_value = ([{'source_db':'message/message_0.db','source_table':'Msg',
             'local_id':'1','timestamp':int((NOW.replace(hour=13)).timestamp())-400*86400}], {})
-        complete = Mock(side_effect=[decision('search',query='餐厅 周一'), decision('finish')])
+        complete = Mock(side_effect=[fixtures.task_completion('查询青叶食堂周一是否营业'),decision('search',query='餐厅 周一'), decision('finish')])
         _, sources, diagnostics = self.run_agent(complete, history=[{'role':'user','content':'青叶食堂如何？'}])
         self.assertEqual(len(sources),1)
-        messages, schema = complete.call_args_list[0].args
+        messages, schema = complete.call_args_list[1].args
         self.assertIsNone(schema)
-        self.assertIn('tools',complete.call_args_list[0].kwargs)
+        self.assertIn('tools',complete.call_args_list[1].kwargs)
         request = json.loads(messages[-1]['content'])
         self.assertNotIn('plan',request)
         self.assertEqual(request['conversation_history'][0]['content'],'青叶食堂如何？')
         self.assertEqual(request['current_time'],NOW.isoformat())
         self.assertIsNone(diagnostics['query_plan']['since_ts'])
-        self.assertEqual(complete.call_count,2)
+        self.assertEqual(request['current_task']['request'],'查询青叶食堂周一是否营业')
+        self.assertEqual(complete.call_count,3)
 
     def test_date_search_then_keyword_search_does_not_inherit_date(self):
         self.insert(1); self.insert(2,days=400)
@@ -58,7 +59,9 @@ class ToolFirstTests(unittest.TestCase):
         _, sources, diagnostics=self.run_agent(complete,question='看看两个小林说了什么')
         self.assertEqual({s['sender_username'] for s in sources},{'alice','bob'})
         observations=json.loads(complete.call_args_list[1].args[0][-1]['content'])['observations']
-        self.assertEqual({p['id'] for p in observations[0]['people']},{'alice','bob'})
+        from wechat_agent.model_ids import model_id
+        self.assertEqual({p['id'] for p in observations[0]['people']},
+                         {model_id('person','alice'),model_id('person','bob')})
         self.assertEqual(diagnostics['query_plan']['people'],[])
 
     def test_per_call_group_filter_does_not_persist(self):

@@ -73,7 +73,11 @@ semantic_search requires embedding. search requires index.query, embedding and l
 and reserves one embedding and one reranking call from the package budgets.
 Task tools never allow background retrieval outside the task window.
 Pages are NOT complete coverage; follow next_offset where supported or report partial coverage.
-api.llm(messages, schema=None, tools=None, tool_choice='auto') -> text/JSON in legacy mode.
+api.llm(messages, schema=None, tools=None, tool_choice='auto') -> text/JSON.
+All wire responses use strict JSON Schema or native strict tool calls. Without schema,
+the host requests {"text": string}, validates it and unwraps the string for existing Skills.
+With schema, the host validates the supplied JSON Schema locally as well. Never use
+regex or markdown extraction as a substitute for a schema when consuming model data.
 With tools=[shared tool NAMES], returns {message: assistant message, finish_reason: ...}.
 Native mode accepts assistant tool_calls and matching role='tool' messages with tool_call_id.
 The package owns the loop: append the returned assistant message, json.loads each function's

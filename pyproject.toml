@@ -13,6 +13,8 @@ dependencies = [
   "zstandard>=0.23",
   "langgraph>=0.6.11,<0.7",
   "langgraph-checkpoint-sqlite==2.0.11",
+  "jsonschema>=4.23,<5",
+  "numpy>=1.24",
 ]
 
 [project.optional-dependencies]
@@ -23,3 +25,16 @@ voice = [
 
 [project.scripts]
 wechat-agent = "wechat_agent.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["wechat_agent*"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 120
+extend-exclude = ["work", "data", "artifacts", "exports", "decrypted", "web_cache"]
+
+[tool.ruff.lint]
+# Correctness checks only: undefined names, unused imports/variables,
+# redefinitions and similar pyflakes findings.
+select = ["F"]

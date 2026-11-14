@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from wechat_agent import web
-from wechat_agent.qa_answers import QA_ANSWER_FORMAT, parse_qa_answer, validate_qa_answer
+from wechat_agent.qa_answers import QA_ANSWER_FORMAT, qa_answer_format, parse_qa_answer, validate_qa_answer
 
 
 def answer(refs=None, text="Add demo and evaluation links to the resume.", kind="answer"):
@@ -25,6 +25,37 @@ def sources():
 
 
 class AnswerContractTests(unittest.TestCase):
+    def test_generation_schema_is_bound_to_each_final_context(self):
+        original = copy.deepcopy(QA_ANSWER_FORMAT)
+        for count in (1, 13, 2000):
+            schema = qa_answer_format(count)['json_schema']['schema']
+            paragraphs = schema['properties']['paragraphs']
+            self.assertEqual(paragraphs['minItems'], 1)
+            branches = paragraphs['items']['anyOf']
+            for branch, kind in zip(branches, ('answer', 'limitation')):
+                props = branch['properties']
+                self.assertEqual(props['kind']['enum'], [kind])
+                self.assertEqual(props['source_refs']['items'],
+                                 {'type':'integer', 'minimum':1, 'maximum':count})
+                self.assertEqual(props['source_refs'].get('minItems', 0), 1 if kind == 'answer' else 0)
+        self.assertEqual(QA_ANSWER_FORMAT, original)
+        for count in (-1, True, '1', 1.5):
+            with self.assertRaises(ValueError):
+                qa_answer_format(count)
+
+    def test_empty_context_schema_only_allows_uncited_limitations(self):
+        item = qa_answer_format(0)['json_schema']['schema']['properties']['paragraphs']['items']
+        self.assertEqual(item['properties']['kind']['enum'], ['limitation'])
+        self.assertEqual(item['properties']['source_refs']['maxItems'], 0)
+
+    def test_shared_completion_uses_current_context_not_history_references(self):
+        complete = Mock(return_value=completion(answer([1])))
+        context = sources()[:1]
+        web.call_qa_answer({}, 'fixture', 'Follow up', context,
+                           history=[{'role':'assistant', 'content':'Previous answer [13]'}], complete=complete)
+        self.assertEqual(complete.call_args.kwargs['response_format'], qa_answer_format(1))
+        self.assertEqual(complete.call_count, 1)
+
     def test_reference_above_twelve_is_valid_and_deduplicated(self):
         self.assertEqual(validate_qa_answer(answer([13, 13, 1]), 13), answer([13, 1]))
 
@@ -62,7 +93,8 @@ class AnswerContractTests(unittest.TestCase):
             result = web.call_qa_answer({}, "fixture", "What did Lin suggest?", sources())
         self.assertEqual(result, answer())
         self.assertEqual(call.call_count, 2)
-        self.assertEqual(call.call_args.kwargs["response_format"], QA_ANSWER_FORMAT)
+        for request in call.call_args_list:
+            self.assertEqual(request.kwargs["response_format"], qa_answer_format(13))
         prompt = call.call_args.args[2][-2]["content"]
         self.assertIn("[13] 会话类型：私聊", prompt)
         self.assertIn("[1] 会话类型：群聊", prompt)

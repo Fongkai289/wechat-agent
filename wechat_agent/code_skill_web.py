@@ -5,7 +5,7 @@ import hashlib
 import json
 
 from .code_skill_packages import validate_package, manifest
-from .code_skill_service import require_validated, run_code_skill, setup
+from .code_skill_service import require_validated, run_code_skill, setup  # noqa: F401  (setup is re-exported)
 from .goals import observation_window, GoalCancelled
 from .platform_runtime import create_platform_runtime, prepare_platform_indexes
 
