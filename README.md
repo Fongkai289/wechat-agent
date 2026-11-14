@@ -1,6 +1,6 @@
 # WeChat Agent
 
-[![Tests and publication safety](https://github.com/Fongkai777/wechat-agent/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Fongkai777/wechat-agent/actions/workflows/ci.yml?query=branch%3Amain)
+[![Tests and publication safety](https://github.com/Fongkai289/wechat-agent/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Fongkai289/wechat-agent/actions/workflows/ci.yml?query=branch%3Amain)
 
 [English](README.md) | [中文](README.zh-CN.md)
 
@@ -36,7 +36,7 @@ hybrid search requires Embedding and Rerank, which are not shown in this video.
 Python 3.9+ is sufficient for browsing and local indexing. Run from a terminal:
 
 ```bash
-git clone https://github.com/Fongkai777/wechat-agent.git
+git clone https://github.com/Fongkai289/wechat-agent.git
 cd wechat-agent
 python3 -m venv .venv
 source .venv/bin/activate
@@ -194,7 +194,7 @@ If Command Line Tools are not installed, run `xcode-select --install` and finish
 the installer first. Then:
 
 ```bash
-git clone https://github.com/Fongkai777/wechat-agent.git
+git clone https://github.com/Fongkai289/wechat-agent.git
 cd wechat-agent
 python3 -m venv .venv
 source .venv/bin/activate

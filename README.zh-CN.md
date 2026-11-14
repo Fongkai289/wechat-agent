@@ -1,6 +1,6 @@
 # WeChat Agent
 
-[![测试与发布安全检查](https://github.com/Fongkai777/wechat-agent/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Fongkai777/wechat-agent/actions/workflows/ci.yml?query=branch%3Amain)
+[![测试与发布安全检查](https://github.com/Fongkai289/wechat-agent/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Fongkai289/wechat-agent/actions/workflows/ci.yml?query=branch%3Amain)
 
 [English](README.md) | [中文](README.zh-CN.md)
 
@@ -34,7 +34,7 @@ WeChat Agent 帮你从分散的私聊和群聊中找回信息：回顾过去的�
 使用 Python 3.9+ 即可体验聊天浏览与本地索引：
 
 ```bash
-git clone https://github.com/Fongkai777/wechat-agent.git
+git clone https://github.com/Fongkai289/wechat-agent.git
 cd wechat-agent
 python3 -m venv .venv
 source .venv/bin/activate
@@ -179,7 +179,7 @@ Apple Command Line Tools。数据库密钥提取受微信与 macOS 版本影响�
 然后执行：
 
 ```bash
-git clone https://github.com/Fongkai777/wechat-agent.git
+git clone https://github.com/Fongkai289/wechat-agent.git
 cd wechat-agent
 python3 -m venv .venv
 source .venv/bin/activate
